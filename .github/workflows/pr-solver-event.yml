@@ -1,0 +1,25 @@
+name: PR solver event fast path
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: pr-solver-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  solve:
+    uses: ivangegovdve-sudo/hermes_agents/.github/workflows/pr-event-solver-reusable.yml@main
+    with:
+      repo: ${{ github.repository }}
+      pr: ${{ github.event.pull_request.number }}
+      event: ${{ github.event.action }}
+    secrets: inherit
