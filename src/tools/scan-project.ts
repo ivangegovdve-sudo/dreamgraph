@@ -40,6 +40,7 @@ import { atomicWriteFile } from "../utils/atomic-write.js";
 import { getLlmProvider, getDreamerLlmConfig, isLlmAvailable } from "../cognitive/llm.js";
 import type { LlmMessage } from "../cognitive/llm.js";
 import { dream } from "../cognitive/dreamer.js";
+import { writeGraphManifest } from "../cognitive/cycle-input-gate.js";
 import { normalize } from "../cognitive/normalizer.js";
 import { engine } from "../cognitive/engine.js";
 import { discoverAndRecordADRs } from "../instance/bootstrap.js";
@@ -1402,6 +1403,14 @@ export async function runScanProject(opts: RunScanOptions = {}): Promise<ScanPro
   const indexEntries = await rebuildIndex();
   logger.info(`scan_project: index rebuilt with ${indexEntries} entries`);
 
+  // Stamp the graph before the optional auto-dream phase. The dreamer also
+  // enforces this gate, so a partial scan cannot silently become a cycle.
+  try {
+    await writeGraphManifest({ repos: config.repos });
+  } catch (err) {
+    errors.push(`Graph freshness stamp failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   const changedNodeCount = featureResult.inserted + featureResult.updated +
     workflowResult.inserted + workflowResult.updated + dataModelResult.inserted + dataModelResult.updated +
     (uiResult?.inserted ?? 0) + (uiResult?.updated ?? 0) +
@@ -1525,6 +1534,14 @@ export async function runScanProject(opts: RunScanOptions = {}): Promise<ScanPro
       errors.push(`Post-scan backlink pass failed: ${msg}`);
       logger.warn(`scan_project: backlink hook error: ${msg}`);
     }
+  }
+
+  // Auto-dreaming may promote entities into the seed graph; refresh the stamp
+  // after all scanner and integrity writes have settled.
+  try {
+    await writeGraphManifest({ repos: config.repos });
+  } catch (err) {
+    errors.push(`Final graph freshness stamp failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   const dreamSummary = dreamCycleResult

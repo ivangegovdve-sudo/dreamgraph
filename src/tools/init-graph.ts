@@ -31,6 +31,7 @@ import { invalidateCache } from "../utils/cache.js";
 import { success, error, safeExecute } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { getLlmConfig } from "../cognitive/llm.js";
+import { writeGraphManifest } from "../cognitive/cycle-input-gate.js";
 import { shouldSkipScanDirectory } from "./scanner-artifact-policy.js";
 import type {
   Feature,
@@ -729,7 +730,10 @@ export function registerInitGraphTool(server: McpServer): void {
           await writeSeedFile("data_model.json", allDataModel);
           await writeSeedFile("system_overview.json", overview);
           await writeSeedFile("index.json", index);
-          const writtenFiles = ["features.json", "workflows.json", "data_model.json", "system_overview.json", "index.json"];
+          await writeGraphManifest({
+            repos: Object.fromEntries(repoConfigs.map((repoConfig) => [repoConfig.name, repoConfig.local_path])),
+          });
+          const writtenFiles = ["features.json", "workflows.json", "data_model.json", "system_overview.json", "index.json", "graph_manifest.json"];
 
           const summary = `Bootstrapped graph from ${repoConfigs.length} repo(s), ${totalFiles} file(s): ${allFeatures.length} features, ${allWorkflows.length} workflows, ${allDataModel.length} data model entities, ${linkCount} cross-links.`;
 

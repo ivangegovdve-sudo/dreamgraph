@@ -81,6 +81,8 @@ import {
 import { logger } from "../utils/logger.js";
 import { success, error, safeExecute } from "../utils/errors.js";
 import { formatJsonToolOutput } from "../utils/tool-output.js";
+import { preflightGraphInputs, CycleInputGateError } from "./cycle-input-gate.js";
+import { cycleOutcomeForFindingCount, unknownCycleResponse } from "./cycle-outcome.js";
 import type {
   DreamCycleOutput,
   NormalizeDreamsOutput,
@@ -735,6 +737,8 @@ export function registerCognitiveTools(server: McpServer): void {
 
       const result = await safeExecute<DreamCycleOutput>(
         async (): Promise<ToolResponse<DreamCycleOutput>> => {
+          const input = await preflightGraphInputs();
+          if (input.status === "UNKNOWN") return unknownCycleResponse(input);
           const transitions: string[] = [];
 
           // Ensure we're awake before starting
@@ -761,11 +765,17 @@ export function registerCognitiveTools(server: McpServer): void {
           const tensionsReactivated = await engine.processRecheckWindows();
 
           // Step 2: Dream (with duplicate suppression built-in)
-          const dreamResult = await dream(strat, maxD, {
-            entity_ids: focus_entities ?? [],
-            hops: focus_hops ?? 2,
-            reason: focus_reason,
-          });
+          let dreamResult;
+          try {
+            dreamResult = await dream(strat, maxD, {
+              entity_ids: focus_entities ?? [],
+              hops: focus_hops ?? 2,
+              reason: focus_reason,
+            });
+          } catch (err) {
+            if (err instanceof CycleInputGateError) return unknownCycleResponse(err.input);
+            throw err;
+          }
 
           let normResult = undefined;
           let promoted = 0;
@@ -899,6 +909,8 @@ export function registerCognitiveTools(server: McpServer): void {
           }
 
           return success<DreamCycleOutput>({
+            outcome: cycleOutcomeForFindingCount(dreamResult.nodes.length + dreamResult.edges.length),
+            graph_version: input.graph_version,
             cycle_number: engine.getCurrentDreamCycle(),
             state_transitions: transitions,
             dreams_generated: {
@@ -1624,11 +1636,12 @@ export function registerCognitiveTools(server: McpServer): void {
           "injection_surface",
           "missing_validation",
           "broken_access_control",
+          "all_threats",
           "all",
         ])
         .optional()
         .describe(
-          'Adversarial strategy. "all" runs all five. Default: "all".'
+          'Adversarial strategy. "all" or "all_threats" runs all five. Default: "all".'
         ),
     },
     async ({ strategy }) => {
@@ -1637,6 +1650,8 @@ export function registerCognitiveTools(server: McpServer): void {
 
       const result = await safeExecute<NightmareResult>(
         async (): Promise<ToolResponse<NightmareResult>> => {
+          const input = await preflightGraphInputs();
+          if (input.status === "UNKNOWN") return unknownCycleResponse(input);
           // Ensure awake
           if (engine.getState() !== "awake") {
             await engine.interrupt();
@@ -1645,7 +1660,13 @@ export function registerCognitiveTools(server: McpServer): void {
           // AWAKE → NIGHTMARE
           engine.enterNightmare();
 
-          const nightmareResult = await nightmare(strat as any);
+          let nightmareResult: NightmareResult;
+          try {
+            nightmareResult = await nightmare(strat as any, input.graph_version);
+          } catch (err) {
+            if (err instanceof CycleInputGateError) return unknownCycleResponse(err.input);
+            throw err;
+          }
 
           // NIGHTMARE → AWAKE
           engine.wakeFromNightmare();
