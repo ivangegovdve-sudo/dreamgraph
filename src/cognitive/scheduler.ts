@@ -42,6 +42,10 @@ import { logger } from "../utils/logger.js";
 import { getLlmReadinessStatus } from "./llm-readiness.js";
 import { getLlmProvider, getNormalizerLlmConfig } from "./llm.js";
 import type { LlmMessage } from "./llm.js";
+import { preflightGraphInputs } from "./cycle-input-gate.js";
+import { formatCycleSummary } from "./cycle-outcome.js";
+import type { CycleOutcome, ScheduleActionResult } from "./cycle-outcome.js";
+import type { CycleInputReady } from "./cycle-input-gate.js";
 import type { TensionResolutionCandidate, TensionResolutionStrategy, TensionSignal } from "./types.js";
 import { withFileLock } from "../utils/mutex.js";
 import { DEFAULT_SCHEDULER_CONFIG } from "./types.js";
@@ -197,7 +201,7 @@ const SCHEDULER_EXEC_LOCK = "scheduler.execution";
  * underlying action promise is left to settle on its own; we cannot truly
  * cancel a Node Promise, but we no longer wait for it.
  */
-async function executeActionWithTimeout(schedule: DreamSchedule): Promise<string> {
+async function executeActionWithTimeout(schedule: DreamSchedule): Promise<ScheduleActionResult> {
   const timeoutMs = Math.max(1_000, config.execution_timeout_ms);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -382,7 +386,22 @@ function isCronDue(cron: string, lastRun: string | null, now: number): boolean {
 // Action Execution
 // ---------------------------------------------------------------------------
 
-async function executeAction(schedule: DreamSchedule): Promise<string> {
+async function executeAction(schedule: DreamSchedule): Promise<ScheduleActionResult> {
+  let cycleInput: CycleInputReady | undefined;
+  if (schedule.action === "dream_cycle" || schedule.action === "nightmare_cycle") {
+    const input = await preflightGraphInputs();
+    if (input.status === "UNKNOWN") {
+      const strategy = typeof schedule.parameters?.strategy === "string"
+        ? schedule.parameters.strategy
+        : schedule.action === "dream_cycle" ? "all" : "all_threats";
+      return {
+        summary: formatCycleSummary(schedule.action, strategy, "UNKNOWN", undefined, input.message),
+        outcome: "UNKNOWN",
+        graph_version: input.graph_version,
+      };
+    }
+    cycleInput = input;
+  }
   switch (schedule.action) {
     case "dream_cycle": {
       const params = parseScheduleParams(schedule, DreamCycleParamsSchema);
@@ -553,7 +572,12 @@ async function executeAction(schedule: DreamSchedule): Promise<string> {
 
       if (engine.getState() !== "awake") await engine.interrupt();
 
-      return `dream_cycle(${strategy}${dreamResult.focus_entities.length > 0 ? `, focus=${dreamResult.focus_entities.length}` : ""}): ${dreamResult.edges.length} edges, ${normResult.promotedEdges.length} promoted, ${normResult.rejected} rejected${resolverSummary}`;
+      return {
+        summary: `dream_cycle(${strategy}${dreamResult.focus_entities.length > 0 ? `, focus=${dreamResult.focus_entities.length}` : ""}): ${dreamResult.outcome}, ${dreamResult.edges.length} edges, ${normResult.promotedEdges.length} promoted, ${normResult.rejected} rejected${resolverSummary}`,
+        outcome: dreamResult.outcome,
+        finding_count: dreamResult.edges.length + dreamResult.nodes.length,
+        graph_version: cycleInput!.graph_version,
+      };
     }
 
     case "nightmare_cycle": {
@@ -562,18 +586,23 @@ async function executeAction(schedule: DreamSchedule): Promise<string> {
 
       if (engine.getState() !== "awake") await engine.interrupt();
       engine.enterNightmare();
-      const result = await nightmare(strategy);
+      const result = await nightmare(strategy, cycleInput!.graph_version);
       engine.wakeFromNightmare();
 
       if (engine.getState() !== "awake") await engine.interrupt();
 
-      return `nightmare_cycle(${strategy}): ${result.threats_found} threats found`;
+      return {
+        summary: formatCycleSummary("nightmare_cycle", strategy, result.outcome, result.threats_found.length),
+        outcome: result.outcome,
+        finding_count: result.threats_found.length,
+        graph_version: result.graph_version,
+      };
     }
 
     case "metacognitive_analysis": {
       const params = parseScheduleParams(schedule, MetacognitiveParamsSchema);
       const entry = await runMetacognitiveAnalysis(params.window_size, params.auto_apply);
-      return `metacognition: ${entry.overall_health}, ${entry.threshold_recommendations.length} recommendations`;
+      return { summary: `metacognition: ${entry.overall_health}, ${entry.threshold_recommendations.length} recommendations` };
     }
 
     case "dispatch_cognitive_event": {
@@ -588,21 +617,21 @@ async function executeAction(schedule: DreamSchedule): Promise<string> {
         description: params.description ?? `Scheduled event from ${schedule.name}`,
       };
       const logEntry = await dispatchEvent(event);
-      return `event dispatched: ${logEntry.result.action_taken}`;
+      return { summary: `event dispatched: ${logEntry.result.action_taken}` };
     }
 
     case "narrative_chapter": {
       const chapter = await generateDiffChapter();
       if (chapter) {
-        return `narrative chapter ${chapter.chapter_number} generated: "${chapter.title}"`;
+        return { summary: `narrative chapter ${chapter.chapter_number} generated: "${chapter.title}"` };
       }
-      return "narrative chapter: no significant changes to narrate";
+      return { summary: "narrative chapter: no significant changes to narrate" };
     }
 
     case "federation_export": {
       const params = parseScheduleParams(schedule, FederationExportParamsSchema);
       const result = await exportArchetypes(params.export_path);
-      return `federation export: ${result.archetypes_exported} archetypes → ${result.file_path}`;
+      return { summary: `federation export: ${result.archetypes_exported} archetypes → ${result.file_path}` };
     }
 
     case "graph_maintenance": {
@@ -613,7 +642,7 @@ async function executeAction(schedule: DreamSchedule): Promise<string> {
       const tensionDecay = await engine.applyTensionDecay();
       await engine.interrupt(); // skip normalization
 
-      return `maintenance: ${decayResult.decayedEdges} edges decayed, ${decayResult.decayedNodes} nodes decayed, ${tensionDecay.expired} tensions expired`;
+      return { summary: `maintenance: ${decayResult.decayedEdges} edges decayed, ${decayResult.decayedNodes} nodes decayed, ${tensionDecay.expired} tensions expired` };
     }
 
     default:
@@ -746,14 +775,29 @@ async function runClaimedSchedule(
   let resultSummary = "";
   let success = true;
   let errorMsg: string | undefined;
+  let outcome: CycleOutcome | undefined;
+  let findingCount: number | undefined;
+  let graphVersion: string | undefined;
 
   try {
     await withFileLock(SCHEDULER_EXEC_LOCK, async () => {
       try {
         logger.info(`Scheduler executing: ${claim.scheduleName} (${claim.action})`);
-        resultSummary = await executeActionWithTimeout(claim.schedule);
+        const result = await executeActionWithTimeout(claim.schedule);
+        resultSummary = result.summary;
+        outcome = result.outcome;
+        findingCount = result.finding_count;
+        graphVersion = result.graph_version;
+        if (outcome === "UNKNOWN") {
+          success = false;
+          errorMsg = result.summary;
+        }
       } catch (err) {
         success = false;
+        if (claim.action === "dream_cycle" || claim.action === "nightmare_cycle") outcome = "UNKNOWN";
+        if (claim.action === "dream_cycle" || claim.action === "nightmare_cycle") {
+          if (engine.getState() !== "awake") await engine.interrupt().catch(() => {});
+        }
         errorMsg = err instanceof Error ? err.message : String(err);
         resultSummary = `Error: ${errorMsg}`;
         logger.error(`Scheduler error for ${claim.scheduleName}: ${errorMsg}`);
@@ -762,7 +806,7 @@ async function runClaimedSchedule(
   } finally {
     // Always run phase 3, even if executeAction threw before completing.
     try {
-      await writeBackExecution(claim, idPrefix, success, resultSummary, errorMsg);
+      await writeBackExecution(claim, idPrefix, success, resultSummary, errorMsg, outcome, findingCount, graphVersion);
     } finally {
       inFlightSchedules.delete(claim.scheduleId);
     }
@@ -774,7 +818,10 @@ async function writeBackExecution(
   idPrefix: "exec" | "exec_cycle",
   success: boolean,
   resultSummary: string,
-  errorMsg: string | undefined
+  errorMsg: string | undefined,
+  outcome?: CycleOutcome,
+  findingCount?: number,
+  graphVersion?: string,
 ): Promise<void> {
   await withFileLock("schedules.json", async () => {
     const file = await loadScheduleFile();
@@ -839,6 +886,9 @@ async function writeBackExecution(
           duration_ms: duration,
           status: schedule.status,
           error: errorMsg ?? null,
+          outcome: outcome ?? null,
+          finding_count: findingCount ?? null,
+          graph_version: graphVersion ?? null,
         },
       });
     }
@@ -853,6 +903,9 @@ async function writeBackExecution(
       duration_ms: duration,
       success,
       result_summary: resultSummary,
+      ...(outcome ? { outcome } : {}),
+      ...(findingCount !== undefined ? { finding_count: findingCount } : {}),
+      ...(graphVersion ? { graph_version: graphVersion } : {}),
       error: errorMsg,
       ...(getActiveScope() && { instance_uuid: getActiveScope()!.uuid }),
     };
@@ -1102,14 +1155,29 @@ export async function runScheduleNow(scheduleId: string): Promise<ScheduleExecut
   let resultSummary = "";
   let success = true;
   let errorMsg: string | undefined;
+  let outcome: CycleOutcome | undefined;
+  let findingCount: number | undefined;
+  let graphVersion: string | undefined;
 
   try {
     await withFileLock(SCHEDULER_EXEC_LOCK, async () => {
       try {
         logger.info(`Scheduler (forced): ${snapshot.scheduleName} (${snapshot.action})`);
-        resultSummary = await executeActionWithTimeout(snapshot.schedule);
+        const result = await executeActionWithTimeout(snapshot.schedule);
+        resultSummary = result.summary;
+        outcome = result.outcome;
+        findingCount = result.finding_count;
+        graphVersion = result.graph_version;
+        if (outcome === "UNKNOWN") {
+          success = false;
+          errorMsg = result.summary;
+        }
       } catch (err) {
         success = false;
+        if (snapshot.action === "dream_cycle" || snapshot.action === "nightmare_cycle") outcome = "UNKNOWN";
+        if (snapshot.action === "dream_cycle" || snapshot.action === "nightmare_cycle") {
+          if (engine.getState() !== "awake") await engine.interrupt().catch(() => {});
+        }
         errorMsg = err instanceof Error ? err.message : String(err);
         resultSummary = `Error: ${errorMsg}`;
       }
@@ -1152,6 +1220,9 @@ export async function runScheduleNow(scheduleId: string): Promise<ScheduleExecut
       duration_ms: duration,
       success,
       result_summary: resultSummary,
+      ...(outcome ? { outcome } : {}),
+      ...(findingCount !== undefined ? { finding_count: findingCount } : {}),
+      ...(graphVersion ? { graph_version: graphVersion } : {}),
       error: errorMsg,
       ...(getActiveScope() && { instance_uuid: getActiveScope()!.uuid }),
     };

@@ -31,6 +31,8 @@ import { loadJsonArray } from "../utils/cache.js";
 import { dataPath } from "../utils/paths.js";
 import { engine } from "./engine.js";
 import { logger } from "../utils/logger.js";
+import { cycleOutcomeForFindingCount } from "./cycle-outcome.js";
+import { requireCycleInputs } from "./cycle-input-gate.js";
 import { graphEventBus } from "../graph/events.js";
 import type { Feature, Workflow, DataModelEntity } from "../types/index.js";
 import type {
@@ -46,6 +48,14 @@ import type {
 // ---------------------------------------------------------------------------
 
 const threatLogPath = () => dataPath("threat_log.json");
+
+export function expandAdversarialStrategies(
+  strategy: AdversarialStrategy,
+): Exclude<AdversarialStrategy, "all" | "all_threats">[] {
+  return strategy === "all" || strategy === "all_threats"
+    ? ["privilege_escalation", "data_leak_path", "injection_surface", "missing_validation", "broken_access_control"]
+    : [strategy];
+}
 
 // ---------------------------------------------------------------------------
 // Fact Graph Snapshot for Security Analysis
@@ -463,8 +473,10 @@ function emptyThreatLog(): ThreatLogFile {
  * The caller must handle AWAKE → NIGHTMARE → AWAKE transitions.
  */
 export async function nightmare(
-  strategy: AdversarialStrategy = "all_threats"
+  strategy: AdversarialStrategy = "all_threats",
+  graphVersion?: string,
 ): Promise<NightmareResult> {
+  const input = await requireCycleInputs();
   engine.assertState("nightmare", "nightmare");
 
   const startTime = Date.now();
@@ -477,10 +489,7 @@ export async function nightmare(
 
   let allThreats: ThreatEdge[] = [];
 
-  const strategies: AdversarialStrategy[] =
-    strategy === "all_threats"
-      ? ["privilege_escalation", "data_leak_path", "injection_surface", "missing_validation", "broken_access_control"]
-      : [strategy];
+  const strategies = expandAdversarialStrategies(strategy);
 
   for (const s of strategies) {
     let threats: ThreatEdge[] = [];
@@ -607,6 +616,8 @@ export async function nightmare(
   });
 
   return {
+    outcome: cycleOutcomeForFindingCount(allThreats.length),
+    graph_version: graphVersion ?? input.graph_version,
     cycle_number: cycle,
     threats_found: allThreats,
     attack_surfaces,

@@ -42,12 +42,14 @@ import { pgoWaveDream } from "./strategies/pgo-wave.js";
 import { llmDream } from "./strategies/llm-dream.js";
 import { orphanBridging } from "./strategies/orphan-bridging.js";
 import { schemaGrounding } from "./strategies/schema-grounding.js";
+import { requireCycleInputs } from "./cycle-input-gate.js";
 
 // ---------------------------------------------------------------------------
 // Public API — Dream Cycle
 // ---------------------------------------------------------------------------
 
 export interface DreamResult {
+  outcome: "DRY" | "FOUND";
   nodes: DreamNode[];
   edges: DreamEdge[];
   duplicates_merged: number;
@@ -125,6 +127,7 @@ export async function dream(
   maxDreams: number = 100,
   focus?: DreamFocus,
 ): Promise<DreamResult> {
+  await requireCycleInputs();
   engine.assertState("rem", "dream");
 
   const cycle = engine.nextDreamCycle();
@@ -333,6 +336,7 @@ export async function dream(
   );
 
   return {
+    outcome: allNodes.length + allEdges.length > 0 ? "FOUND" : "DRY",
     nodes: allNodes,
     edges: allEdges,
     duplicates_merged: totalMerged,

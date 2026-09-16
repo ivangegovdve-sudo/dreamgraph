@@ -73,7 +73,8 @@ export type AdversarialStrategy =
   | "injection_surface"
   | "missing_validation"
   | "broken_access_control"
-  | "all_threats";
+  | "all_threats"
+  | "all";
 
 /** Three-outcome normalization classifier */
 export type NormalizationOutcome = "validated" | "latent" | "rejected";
@@ -878,6 +879,9 @@ export interface DreamInsights {
 // Tool Input/Output types
 // ---------------------------------------------------------------------------
 
+/** Result state for a cognitive cycle. UNKNOWN is never a clean result. */
+export type CycleOutcome = "DRY" | "FOUND" | "UNKNOWN";
+
 export interface DreamCycleInput {
   strategy?: DreamStrategy;
   max_dreams?: number;
@@ -888,6 +892,8 @@ export interface DreamCycleInput {
 }
 
 export interface DreamCycleOutput {
+  outcome: CycleOutcome;
+  graph_version: string;
   cycle_number: number;
   state_transitions: string[];
   dreams_generated: { nodes: number; edges: number };
@@ -1769,6 +1775,8 @@ export interface ThreatEdge {
 
 /** Output of a nightmare cycle */
 export interface NightmareResult {
+  outcome: CycleOutcome;
+  graph_version: string;
   cycle_number: number;
   threats_found: ThreatEdge[];
   attack_surfaces: Array<{
@@ -2451,6 +2459,12 @@ export interface ScheduleExecution {
   duration_ms: number;
   success: boolean;
   result_summary: string;
+  /** Cognitive cycle outcome. Absent for non-cycle scheduled actions. */
+  outcome?: CycleOutcome;
+  /** New findings emitted by this execution, when the action produces findings. */
+  finding_count?: number;
+  /** Graph freshness/version stamp used by a cognitive cycle. */
+  graph_version?: string;
   error?: string;
   /** Instance UUID that produced this execution (null in legacy mode). */
   instance_uuid?: string;
