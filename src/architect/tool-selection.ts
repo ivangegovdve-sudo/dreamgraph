@@ -115,6 +115,7 @@ export const ARCHITECT_TOOL_GROUPS: Record<ArchitectToolGroupKey, readonly strin
     "dream_cycle",
     "normalize_dreams",
     "nightmare_cycle",
+    "run_review_cycle",
     "lucid_dream",
     "lucid_action",
     "wake_from_lucid",

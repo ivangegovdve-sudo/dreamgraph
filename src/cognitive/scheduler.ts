@@ -51,6 +51,7 @@ import {
   isVerdictLedgerEnabled,
 } from "./verdict-ledger.js";
 import { reconcileDreamCycleArtifacts } from "./finding-model.js";
+import { runReviewCycle, getReviewProfile } from "./review-seam.js";
 import type { CycleInputReady } from "./cycle-input-gate.js";
 import type { TensionResolutionCandidate, TensionResolutionStrategy, TensionSignal } from "./types.js";
 import { withFileLock } from "../utils/mutex.js";
@@ -111,6 +112,11 @@ const DreamCycleParamsSchema = z.object({
 
 const NightmareCycleParamsSchema = z.object({
   strategy: z.enum(ADVERSARIAL_STRATEGIES).default("all_threats"),
+});
+
+const ReviewCycleParamsSchema = z.object({
+  profile_id: z.string().trim().min(1).default("dreams-and-nightmares"),
+  expected_graph_version: z.string().trim().min(1).optional(),
 });
 
 const MetacognitiveParamsSchema = z.object({
@@ -621,6 +627,23 @@ async function executeAction(schedule: DreamSchedule): Promise<ScheduleActionRes
       };
     }
 
+    case "review_cycle": {
+      const params = parseScheduleParams(schedule, ReviewCycleParamsSchema);
+      if (!getReviewProfile(params.profile_id)) {
+        throw new Error(`Review profile not found: ${params.profile_id}`);
+      }
+      const report = await runReviewCycle(params.profile_id, {
+        expected_graph_version: params.expected_graph_version,
+      });
+      return {
+        summary: `review_cycle(${params.profile_id}): ${report.outcome}, ${report.findings.length} findings, report=${report.report_id}`,
+        outcome: report.outcome,
+        finding_count: report.findings.length,
+        graph_version: report.context.graph_version ?? undefined,
+        report_id: report.report_id,
+      };
+    }
+
     case "metacognitive_analysis": {
       const params = parseScheduleParams(schedule, MetacognitiveParamsSchema);
       const entry = await runMetacognitiveAnalysis(params.window_size, params.auto_apply);
@@ -800,6 +823,7 @@ async function runClaimedSchedule(
   let outcome: CycleOutcome | undefined;
   let findingCount: number | undefined;
   let graphVersion: string | undefined;
+  let reportId: string | undefined;
 
   try {
     await withFileLock(SCHEDULER_EXEC_LOCK, async () => {
@@ -810,6 +834,7 @@ async function runClaimedSchedule(
         outcome = result.outcome;
         findingCount = result.finding_count;
         graphVersion = result.graph_version;
+        reportId = result.report_id;
         if (outcome === "UNKNOWN") {
           success = false;
           errorMsg = result.summary;
@@ -828,7 +853,7 @@ async function runClaimedSchedule(
   } finally {
     // Always run phase 3, even if executeAction threw before completing.
     try {
-      await writeBackExecution(claim, idPrefix, success, resultSummary, errorMsg, outcome, findingCount, graphVersion);
+      await writeBackExecution(claim, idPrefix, success, resultSummary, errorMsg, outcome, findingCount, graphVersion, reportId);
     } finally {
       inFlightSchedules.delete(claim.scheduleId);
     }
@@ -844,6 +869,7 @@ async function writeBackExecution(
   outcome?: CycleOutcome,
   findingCount?: number,
   graphVersion?: string,
+  reportId?: string,
 ): Promise<void> {
   await withFileLock("schedules.json", async () => {
     const file = await loadScheduleFile();
@@ -911,6 +937,7 @@ async function writeBackExecution(
           outcome: outcome ?? null,
           finding_count: findingCount ?? null,
           graph_version: graphVersion ?? null,
+          report_id: reportId ?? null,
         },
       });
     }
@@ -928,6 +955,7 @@ async function writeBackExecution(
       ...(outcome ? { outcome } : {}),
       ...(findingCount !== undefined ? { finding_count: findingCount } : {}),
       ...(graphVersion ? { graph_version: graphVersion } : {}),
+      ...(reportId ? { report_id: reportId } : {}),
       error: errorMsg,
       ...(getActiveScope() && { instance_uuid: getActiveScope()!.uuid }),
     };
@@ -1180,6 +1208,7 @@ export async function runScheduleNow(scheduleId: string): Promise<ScheduleExecut
   let outcome: CycleOutcome | undefined;
   let findingCount: number | undefined;
   let graphVersion: string | undefined;
+  let reportId: string | undefined;
 
   try {
     await withFileLock(SCHEDULER_EXEC_LOCK, async () => {
@@ -1190,6 +1219,7 @@ export async function runScheduleNow(scheduleId: string): Promise<ScheduleExecut
         outcome = result.outcome;
         findingCount = result.finding_count;
         graphVersion = result.graph_version;
+        reportId = result.report_id;
         if (outcome === "UNKNOWN") {
           success = false;
           errorMsg = result.summary;
@@ -1245,6 +1275,7 @@ export async function runScheduleNow(scheduleId: string): Promise<ScheduleExecut
       ...(outcome ? { outcome } : {}),
       ...(findingCount !== undefined ? { finding_count: findingCount } : {}),
       ...(graphVersion ? { graph_version: graphVersion } : {}),
+      ...(reportId ? { report_id: reportId } : {}),
       error: errorMsg,
       ...(getActiveScope() && { instance_uuid: getActiveScope()!.uuid }),
     };

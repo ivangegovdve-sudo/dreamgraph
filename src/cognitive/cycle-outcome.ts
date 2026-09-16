@@ -8,6 +8,7 @@ export interface ScheduleActionResult {
   outcome?: CycleOutcome;
   finding_count?: number;
   graph_version?: string;
+  report_id?: string;
 }
 
 export function cycleOutcomeForFindingCount(count: number): Exclude<CycleOutcome, "UNKNOWN"> {
