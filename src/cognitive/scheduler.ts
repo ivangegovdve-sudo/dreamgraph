@@ -45,6 +45,7 @@ import type { LlmMessage } from "./llm.js";
 import { preflightGraphInputs } from "./cycle-input-gate.js";
 import { formatCycleSummary } from "./cycle-outcome.js";
 import type { CycleOutcome, ScheduleActionResult } from "./cycle-outcome.js";
+import { emitDreamCycleVerdict, emitNightmareVerdict } from "./verdict-ledger.js";
 import type { CycleInputReady } from "./cycle-input-gate.js";
 import type { TensionResolutionCandidate, TensionResolutionStrategy, TensionSignal } from "./types.js";
 import { withFileLock } from "../utils/mutex.js";
@@ -572,6 +573,13 @@ async function executeAction(schedule: DreamSchedule): Promise<ScheduleActionRes
 
       if (engine.getState() !== "awake") await engine.interrupt();
 
+      await emitDreamCycleVerdict({
+        nodes: dreamResult.nodes,
+        edges: dreamResult.edges,
+        outcome: dreamResult.outcome,
+        graph_version: cycleInput!.graph_version,
+      });
+
       return {
         summary: `dream_cycle(${strategy}${dreamResult.focus_entities.length > 0 ? `, focus=${dreamResult.focus_entities.length}` : ""}): ${dreamResult.outcome}, ${dreamResult.edges.length} edges, ${normResult.promotedEdges.length} promoted, ${normResult.rejected} rejected${resolverSummary}`,
         outcome: dreamResult.outcome,
@@ -588,6 +596,8 @@ async function executeAction(schedule: DreamSchedule): Promise<ScheduleActionRes
       engine.enterNightmare();
       const result = await nightmare(strategy, cycleInput!.graph_version);
       engine.wakeFromNightmare();
+
+      await emitNightmareVerdict(result);
 
       if (engine.getState() !== "awake") await engine.interrupt();
 

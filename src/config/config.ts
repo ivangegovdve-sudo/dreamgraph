@@ -162,6 +162,8 @@ export const config = {
   env: {
     /** Enable verbose stderr logging */
     debug: process.env.DREAMGRAPH_DEBUG === "true",
+    /** Enable the local append-only verdict ledger. Defaults to off. */
+    verdictLedgerEnabled: process.env.DREAMGRAPH_VERDICT_LEDGER_ENABLED === "true",
   },
 
   /**

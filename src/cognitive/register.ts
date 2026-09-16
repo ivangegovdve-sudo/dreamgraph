@@ -83,6 +83,7 @@ import { success, error, safeExecute } from "../utils/errors.js";
 import { formatJsonToolOutput } from "../utils/tool-output.js";
 import { preflightGraphInputs, CycleInputGateError } from "./cycle-input-gate.js";
 import { cycleOutcomeForFindingCount, unknownCycleResponse } from "./cycle-outcome.js";
+import { emitDreamCycleVerdict, emitNightmareVerdict } from "./verdict-ledger.js";
 import type {
   DreamCycleOutput,
   NormalizeDreamsOutput,
@@ -908,6 +909,13 @@ export function registerCognitiveTools(server: McpServer): void {
             }
           }
 
+          await emitDreamCycleVerdict({
+            nodes: dreamResult.nodes,
+            edges: dreamResult.edges,
+            outcome: dreamResult.outcome,
+            graph_version: input.graph_version,
+          });
+
           return success<DreamCycleOutput>({
             outcome: cycleOutcomeForFindingCount(dreamResult.nodes.length + dreamResult.edges.length),
             graph_version: input.graph_version,
@@ -1667,6 +1675,8 @@ export function registerCognitiveTools(server: McpServer): void {
             if (err instanceof CycleInputGateError) return unknownCycleResponse(err.input);
             throw err;
           }
+
+          await emitNightmareVerdict(nightmareResult);
 
           // NIGHTMARE → AWAKE
           engine.wakeFromNightmare();
