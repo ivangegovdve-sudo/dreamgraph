@@ -3,6 +3,7 @@ import {
   getModelCapabilities,
   initLlmProvider,
   llmRouteFailureReason,
+  parseLlmConfig,
   selectLlmRoute,
   type LlmProvider,
 } from "../src/cognitive/llm.js";
@@ -36,6 +37,84 @@ describe("getModelCapabilities", () => {
       supportsStructuredOutputs: true,
       supportsJsonSchema: true,
     });
+  });
+});
+
+describe("OpenAI-compatible provider safety", () => {
+  it("honors the configured model for an explicit compatible endpoint", async () => {
+    await withEnv(
+      {
+        DREAMGRAPH_LLM_PROVIDER: "openai",
+        DREAMGRAPH_LLM_URL: "http://127.0.0.1:1337/v1",
+        DREAMGRAPH_LLM_API_KEY: undefined,
+        DREAMGRAPH_LLM_MODEL: "qwen3-coder",
+      },
+      async () => {
+        expect(parseLlmConfig()).toMatchObject({
+          provider: "openai",
+          baseUrl: "http://127.0.0.1:1337/v1",
+          apiKey: "",
+          model: "qwen3-coder",
+        });
+      },
+    );
+  });
+
+  it("allows an explicit local compatible endpoint without an API key", async () => {
+    const fetchMock = vi.fn(async (input: Request | string | URL) => {
+      expect(String(input)).toBe("http://127.0.0.1:1337/v1/models");
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = initLlmProvider({
+      provider: "openai",
+      model: "qwen3-coder",
+      baseUrl: "http://127.0.0.1:1337/v1",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 2048,
+      timeoutMs: 120_000,
+    });
+
+    await expect(provider.isAvailable()).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not probe api.openai.com when the default provider has no key", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = initLlmProvider({
+      provider: "openai",
+      model: "gpt-4o-mini",
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 2048,
+      timeoutMs: 120_000,
+    });
+
+    await expect(provider.isAvailable()).resolves.toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not send a completion to the default OpenAI endpoint without a key", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = initLlmProvider({
+      provider: "openai",
+      model: "gpt-4o-mini",
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 2048,
+      timeoutMs: 120_000,
+    });
+
+    await expect(provider.complete([{ role: "user", content: "hello" }])).rejects.toThrow(/DREAMGRAPH_LLM_API_KEY/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

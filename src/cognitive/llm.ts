@@ -309,6 +309,7 @@ class OllamaProvider implements LlmProvider {
  * behind a compatibility shim.
  */
 const _jsonSchemaUnsupported = new Set<string>();
+const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
 const OPENAI_MODEL_CAPABILITIES: Array<{ pattern: RegExp; capabilities: Omit<ModelCapabilities, "model"> }> = [
   {
@@ -420,7 +421,14 @@ class OpenAiCompatibleProvider implements LlmProvider {
     this.name = name;
   }
 
+  private isUnconfiguredDefaultOpenAi(): boolean {
+    return this.name === "openai" &&
+      this.baseUrl.replace(/\/+$/, "") === OPENAI_DEFAULT_BASE_URL &&
+      this.apiKey.trim().length === 0;
+  }
+
   async isAvailable(): Promise<boolean> {
+    if (this.isUnconfiguredDefaultOpenAi()) return false;
     try {
       const res = await fetch(`${this.baseUrl}/models`, {
         headers: { Authorization: `Bearer ${this.apiKey}` },
@@ -433,6 +441,11 @@ class OpenAiCompatibleProvider implements LlmProvider {
   }
 
   async complete(messages: LlmMessage[], options?: LlmCompletionOptions): Promise<LlmResponse> {
+    if (this.isUnconfiguredDefaultOpenAi()) {
+      throw new Error(
+        "OpenAI provider is missing DREAMGRAPH_LLM_API_KEY; configure a key or set DREAMGRAPH_LLM_URL to an explicit OpenAI-compatible endpoint.",
+      );
+    }
     const temp = options?.temperature ?? this.defaultTemperature;
     const maxTokens = options?.maxTokens ?? this.defaultMaxTokens;
     const model = options?.model ?? this.model;
@@ -1171,8 +1184,8 @@ export function parseLlmConfig(): LlmConfig {
 
   // Provider defaults — model/temperature/maxTokens serve as fallbacks
   // for per-component configs (dreamer, normalizer) when their env vars
-  // are not set.  There are no base MODEL/TEMPERATURE/MAX_TOKENS env vars;
-  // each component manages its own.
+  // are not set. The base model can be selected with DREAMGRAPH_LLM_MODEL;
+  // temperature and maxTokens remain shared defaults.
   const temperature = 0.7;
   const maxTokens = 2048;
   const timeoutEnv = Number(process.env.DREAMGRAPH_LLM_TIMEOUT_MS);
@@ -1197,8 +1210,8 @@ export function parseLlmConfig(): LlmConfig {
       apiKey = process.env.DREAMGRAPH_LLM_API_KEY ?? "lm-studio";
       break;
     case "openai":
-      model = "gpt-4o-mini";
-      baseUrl = process.env.DREAMGRAPH_LLM_URL ?? "https://api.openai.com/v1";
+      model = process.env.DREAMGRAPH_LLM_MODEL ?? "gpt-4o-mini";
+      baseUrl = process.env.DREAMGRAPH_LLM_URL ?? OPENAI_DEFAULT_BASE_URL;
       apiKey = process.env.DREAMGRAPH_LLM_API_KEY ?? "";
       break;
     case "anthropic":
@@ -1275,7 +1288,7 @@ function providerDefaults(provider: LlmProviderType, base: LlmConfig): Pick<LlmC
     case "lmstudio":
       return { model: envText("DREAMGRAPH_LLM_MODEL") ?? "", baseUrl: "http://localhost:1234/v1", apiKey: "lm-studio" };
     case "openai":
-      return { model: "gpt-4o-mini", baseUrl: "https://api.openai.com/v1", apiKey: process.env.DREAMGRAPH_LLM_API_KEY ?? "" };
+      return { model: envText("DREAMGRAPH_LLM_MODEL") ?? "gpt-4o-mini", baseUrl: OPENAI_DEFAULT_BASE_URL, apiKey: process.env.DREAMGRAPH_LLM_API_KEY ?? "" };
     case "anthropic":
       return { model: "claude-sonnet-4-20250514", baseUrl: "https://api.anthropic.com/v1", apiKey: process.env.DREAMGRAPH_LLM_API_KEY ?? "" };
     case "sampling":
