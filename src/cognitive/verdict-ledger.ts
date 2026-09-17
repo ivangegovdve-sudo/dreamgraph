@@ -1,8 +1,7 @@
-import { mkdir, open, readFile } from "node:fs/promises";
+import { mkdir, open, readFile, truncate } from "node:fs/promises";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { config } from "../config/config.js";
 import { getDataDir } from "../utils/paths.js";
 import { withFileLock } from "../utils/mutex.js";
 import type { DreamEdge, DreamNode, NightmareResult } from "./types.js";
@@ -55,7 +54,7 @@ export interface AppendVerdictLedgerResult {
 }
 
 export function isVerdictLedgerEnabled(): boolean {
-  return config.env.verdictLedgerEnabled;
+  return process.env.DREAMGRAPH_VERDICT_LEDGER_ENABLED === "true";
 }
 
 function isoTime(value: string | Date | undefined): string {
@@ -66,7 +65,10 @@ function uniqueFindings(findings: readonly UnifiedFinding[]): UnifiedFinding[] {
   return [...new Map(findings.map((finding) => [finding.finding_id, finding])).values()];
 }
 
-export async function readVerdictLedger(dataDir = getDataDir()): Promise<VerdictLedgerEntry[]> {
+async function readVerdictLedgerFile(
+  dataDir: string,
+  repairTornTail: boolean,
+): Promise<VerdictLedgerEntry[]> {
   const ledgerPath = resolve(dataDir, VERDICT_LEDGER_FILE);
   let raw: string;
   try {
@@ -75,13 +77,38 @@ export async function readVerdictLedger(dataDir = getDataDir()): Promise<Verdict
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw err;
   }
-  return raw.split(/\r?\n/).filter(Boolean).map((line, index) => {
+
+  const lines = raw.split(/\r?\n/);
+  const hasTrailingNewline = raw.endsWith("\n");
+  const completeLines = lines.slice(0, -1);
+  const finalLine = hasTrailingNewline ? undefined : lines.at(-1);
+  const entries: VerdictLedgerEntry[] = [];
+
+  for (const [index, line] of completeLines.entries()) {
+    if (!line) continue;
     try {
-      return JSON.parse(line) as VerdictLedgerEntry;
+      entries.push(JSON.parse(line) as VerdictLedgerEntry);
     } catch {
-      throw new Error(`Verdict ledger record ${index + 1} is not valid JSON`);
+      throw new Error("Verdict ledger record " + (index + 1) + " is not valid JSON");
     }
-  });
+  }
+
+  if (finalLine) {
+    try {
+      entries.push(JSON.parse(finalLine) as VerdictLedgerEntry);
+    } catch {
+      if (!repairTornTail) return entries;
+      const lastNewline = raw.lastIndexOf("\n");
+      const intactPrefix = lastNewline >= 0 ? raw.slice(0, lastNewline + 1) : "";
+      await truncate(ledgerPath, Buffer.byteLength(intactPrefix, "utf8"));
+    }
+  }
+
+  return entries;
+}
+
+export async function readVerdictLedger(dataDir = getDataDir()): Promise<VerdictLedgerEntry[]> {
+  return readVerdictLedgerFile(dataDir, false);
 }
 
 export async function appendVerdictLedger(
@@ -106,7 +133,7 @@ export async function appendVerdictLedger(
   const ledgerPath = resolve(dataDir, VERDICT_LEDGER_FILE);
 
   return withFileLock(ledgerPath, async () => {
-    const prior = await readVerdictLedger(dataDir);
+    const prior = await readVerdictLedgerFile(dataDir, true);
     const previous = prior.at(-1);
     const seen = new Set(prior.flatMap((entry) => entry.finding_ids));
     const findingIds = findings.map((finding) => finding.finding_id);
@@ -128,7 +155,9 @@ export async function appendVerdictLedger(
 
     const handle = await open(ledgerPath, "a");
     try {
-      await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf8");
+      const existing = await readFile(ledgerPath, "utf8");
+      const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+      await handle.writeFile(separator + JSON.stringify(entry) + "\n", "utf8");
       await handle.datasync();
     } finally {
       await handle.close();

@@ -83,7 +83,12 @@ import { success, error, safeExecute } from "../utils/errors.js";
 import { formatJsonToolOutput } from "../utils/tool-output.js";
 import { preflightGraphInputs, CycleInputGateError } from "./cycle-input-gate.js";
 import { cycleOutcomeForFindingCount, unknownCycleResponse } from "./cycle-outcome.js";
-import { emitDreamCycleVerdict, emitNightmareVerdict } from "./verdict-ledger.js";
+import {
+  emitDreamCycleVerdict,
+  emitNightmareVerdict,
+  isVerdictLedgerEnabled,
+} from "./verdict-ledger.js";
+import { reconcileDreamCycleArtifacts } from "./finding-model.js";
 import type {
   DreamCycleOutput,
   NormalizeDreamsOutput,
@@ -819,6 +824,13 @@ export function registerCognitiveTools(server: McpServer): void {
             transitions.push("rem → awake (no normalization)");
           }
 
+          const ledgerArtifacts = isVerdictLedgerEnabled()
+            ? reconcileDreamCycleArtifacts(
+                { nodes: dreamResult.nodes, edges: dreamResult.edges },
+                await engine.loadDreamGraph(),
+              )
+            : { nodes: dreamResult.nodes, edges: dreamResult.edges };
+
           const duration = Date.now() - startTime;
 
           // Record history entry
@@ -910,8 +922,8 @@ export function registerCognitiveTools(server: McpServer): void {
           }
 
           await emitDreamCycleVerdict({
-            nodes: dreamResult.nodes,
-            edges: dreamResult.edges,
+            nodes: ledgerArtifacts.nodes,
+            edges: ledgerArtifacts.edges,
             outcome: dreamResult.outcome,
             graph_version: input.graph_version,
           });

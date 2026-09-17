@@ -5,6 +5,8 @@ import { getDataDir } from "../utils/paths.js";
 import type {
   CycleOutcome,
   DreamEdge,
+  DreamEdgeStatus,
+  DreamGraphFile,
   DreamNode,
   ThreatEdge,
   ThreatSeverity,
@@ -84,6 +86,40 @@ function metaReferences(meta: Record<string, unknown> | undefined): string[] {
   }));
 }
 
+function nextActionForDreamStatus(status: DreamEdgeStatus): string {
+  switch (status) {
+    case "latent":
+      return "gather more evidence";
+    case "validated":
+      return "use validated opportunity";
+    case "rejected":
+      return "discard opportunity";
+    case "expired":
+      return "discard expired opportunity";
+    case "candidate":
+      return "validate opportunity";
+  }
+}
+
+export function reconcileDreamCycleArtifacts(
+  generated: {
+    nodes: readonly DreamNode[];
+    edges: readonly DreamEdge[];
+  },
+  persisted: Pick<DreamGraphFile, "nodes" | "edges">,
+): {
+  nodes: DreamNode[];
+  edges: DreamEdge[];
+} {
+  const persistedNodes = new Map(persisted.nodes.map((node) => [node.id, node]));
+  const persistedEdges = new Map(persisted.edges.map((edge) => [edge.id, edge]));
+
+  return {
+    nodes: generated.nodes.map((node) => persistedNodes.get(node.id) ?? node),
+    edges: generated.edges.map((edge) => persistedEdges.get(edge.id) ?? edge),
+  };
+}
+
 export function findingFromDreamEdge(edge: DreamEdge, context: FindingContext): UnifiedFinding {
   const affectedEntities = unique([edge.from, edge.to]);
   return {
@@ -100,7 +136,7 @@ export function findingFromDreamEdge(edge: DreamEdge, context: FindingContext): 
     severity: null,
     rationale: edge.reason,
     lifecycle_state: edge.status,
-    next_action: "validate opportunity",
+    next_action: nextActionForDreamStatus(edge.status),
     outcome: context.outcome,
     provenance: { kind: "dream_edge", edge },
   };
@@ -122,7 +158,7 @@ export function findingFromDreamNode(node: DreamNode, context: FindingContext): 
     severity: null,
     rationale: node.description,
     lifecycle_state: node.status,
-    next_action: "validate opportunity",
+    next_action: nextActionForDreamStatus(node.status),
     outcome: context.outcome,
     provenance: { kind: "dream_node", node },
   };
