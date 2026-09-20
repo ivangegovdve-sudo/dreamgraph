@@ -1,0 +1,159 @@
+# Merge a pull request the moment a human approves it.
+#
+# THE PROBLEM THIS SOLVES
+# -----------------------
+# Review without merge is where the work dies. #117 sat approved and conflicted
+# for six days. #176 aged into a conflict. #154 was nearly closed. All three
+# were finished; what killed them was the gap between someone saying yes and
+# someone clicking the button. Approval is the decision. The button is not a
+# second decision, so it should not need a second human.
+#
+# WHY THE GATE IS IN CODE INSTEAD OF `gh pr merge --auto`
+# -------------------------------------------------------
+# Native auto-merge waits for *required* checks and *required* reviews, and both
+# live in branch protection or rulesets - paid features on a private repo:
+#
+#     GET .../branches/main/protection   -> 403 "Upgrade to GitHub Pro"
+#     GET .../rulesets                   -> 403 same
+#     GET .../branches/main              -> "protected": false
+#
+# With nothing required, `--auto` has nothing to wait for. It would not be an
+# approval gate; it would be "merge now", and PRs would land with no approval at
+# all. So the gate lives in tools/pr_merge_gate.py where it is readable and
+# tested. Move to branch protection the day this repo goes public or the account
+# moves to Pro, and delete this file.
+#
+# WHAT MAY APPROVE  (rewritten 2026-09-04)
+# ----------------
+# An APPROVED review, on the current head, from a principal on MERGE_APPROVERS
+# that did not write the code.
+#
+# The rule used to be "a named human, and no bot ever". That was written when a
+# human approval was the only independence signal available - and it had to go,
+# because Ivan does not review code. Every merge routed around the gate instead,
+# including the one that shipped #427. A control everyone bypasses is worse than
+# no control: it makes the bypass the normal path.
+#
+# WHAT REPLACED IT IS NOT WEAKER. A bot may approve; the bot that WROTE the code
+# may not, and neither may any principal whose model family appears in the commit
+# trailers. The property is "the verdict came from a process the orchestrator
+# cannot author" - different weights is a consequence of that, checked second,
+# never sufficient alone. There is deliberately no override flag.
+#
+# ⚠ MERGE_APPROVERS NOW LISTS REVIEWER PRINCIPALS, NOT PEOPLE. The fallback is
+# the estate's reviewer App, which is the only identity that has ever submitted
+# an APPROVED review on this repo. If `vars.MERGE_APPROVERS` is set in repo
+# settings it still wins, and it must be updated to match - a stale value naming
+# only a human would refuse every review this gate now accepts.
+#
+# ONE DEPLOYMENT NOTE THAT MATTERS  (corrected 2026-09-06)
+# --------------------------------
+# For `pull_request_review`, GitHub runs the workflow file from the pull
+# request's merge ref -- the PR's own version of this file -- not from `main`.
+# Measured on #434: the first run under the fixed filter executed before the
+# fix was merged. So a change to this file is exercised by the very PR that
+# carries it. (The earlier note claimed the opposite and was wrong.)
+
+name: Merge on approval
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  # The gate reads the PR's statusCheckRollup ("CI at decision time") and both it
+  # and the wait step need each check's WORKFLOW NAME, which GitHub serves through
+  # the check suite's workflow run. Reading that needs `actions: read`; `checks`
+  # and `statuses` alone still answered "Resource not accessible by integration"
+  # (#434, 2026-09-06: two runs died there, the second after a 25-minute wait
+  # that never got an answer either).
+  actions: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: merge-on-approval-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    # Cheap pre-filter so an ordinary review comment does not spin up a runner.
+    # It is NOT the security boundary - pr_merge_gate.py re-checks all of this,
+    # because a filter that lives in YAML is a filter nobody can unit test.
+    #
+    # ⚠ 2026-09-06: this filter used to also refuse `review.user.type == 'Bot'`,
+    # a leftover of the "no bot ever" rule the 2026-09-04 rewrite replaced. The
+    # only principal that has ever approved on this repo is the reviewer App,
+    # which IS a Bot, so every approval since the rewrite skipped here: 40 of 40
+    # review-triggered runs, and #433 had to be merged by hand with the gate.
+    # Whether a bot may approve is the gate's decision (independence from the
+    # author, allowlist), not YAML's. tests/test_auto_merge_workflow_prefilter.py
+    # refuses the clause from coming back.
+    if: >-
+      github.event.review.state == 'approved' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The approval usually lands while CI is still running, and the gate rightly
+      # refuses "CI has not finished". Nothing re-fires this workflow when CI
+      # completes, so without a wait an early approval is simply lost. The wait
+      # covers OTHER workflows' checks only: this job's own check run is in
+      # progress for as long as it waits, so `gh pr checks --watch` would watch
+      # itself to the timeout (reviewer finding on #434). Bounded at 25 minutes;
+      # the gate, which also ignores this workflow's own check, decides after.
+      - name: Wait for the other workflows' checks to finish
+        env:
+          GH_TOKEN: ${{ secrets.PR_AUTOMATION_TOKEN || github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SELF_WORKFLOW: ${{ github.workflow }}
+        run: |
+          # Only a literal "0" ends the wait. A failed or empty query is "unknown", and
+          # unknown keeps waiting (reviewer finding on #434: an empty answer must not
+          # read as "nothing pending"). If it stays unknown to the bound, the gate
+          # decides, and it refuses on pending CI.
+          for i in $(seq 1 100); do
+            pending=$(gh pr checks "$PR" --repo "${{ github.repository }}" --json state,workflow \
+              --jq "[.[] | select(.workflow != \"$SELF_WORKFLOW\")
+                        | select(.state == \"PENDING\" or .state == \"IN_PROGRESS\" or .state == \"QUEUED\"
+                                 or .state == \"WAITING\" or .state == \"EXPECTED\")] | length" 2>/dev/null || true)
+            echo "other workflows' checks still running: ${pending:-unknown}"
+            if [ "$pending" = "0" ]; then break; fi
+            sleep 15
+          done
+
+      - name: Gate, record, merge
+        env:
+          # Passed as environment variables, never interpolated into the shell.
+          # GitHub logins cannot contain shell metacharacters today, so this is
+          # hardening rather than a live hole -- but a `run:` block holding a
+          # write token is the wrong place to depend on someone else's charset
+          # rules staying the same.
+          APPROVER: ${{ github.event.review.user.login }}
+          APPROVER_TYPE: ${{ github.event.review.user.type }}
+          # The commit the human actually approved; the gate refuses if the PR
+          # head has moved since.
+          APPROVED_SHA: ${{ github.event.review.commit_id }}
+          GH_TOKEN: ${{ secrets.PR_AUTOMATION_TOKEN || github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # Deliberate, reviewable list - not "anyone with write access".
+          # Override with a repository variable to add a second human.
+          MERGE_APPROVERS: ${{ vars.MERGE_APPROVERS || 'ivan-codex-reviewer' }}
+        run: |
+          set -euo pipefail
+          python tools/pr_merge_gate.py \
+            --pr "${{ github.event.pull_request.number }}" \
+            --approver "$APPROVER" \
+            --approver-type "$APPROVER_TYPE" \
+            --approved-sha "$APPROVED_SHA" \
+            --approval-source github-review \
+            --review-state "${{ github.event.review.state }}" \
+            --reference "${{ github.event.review.html_url }}" \
+            --merge-method squash \
+            | tee -a "$GITHUB_STEP_SUMMARY"
