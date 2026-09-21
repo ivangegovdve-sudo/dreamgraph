@@ -34,6 +34,7 @@ import { logger } from "../utils/logger.js";
 import { cycleOutcomeForFindingCount } from "./cycle-outcome.js";
 import { requireCycleInputs } from "./cycle-input-gate.js";
 import { graphEventBus } from "../graph/events.js";
+import type { FactSnapshot } from "./strategies/_shared.js";
 import type { Feature, Workflow, DataModelEntity } from "../types/index.js";
 import type {
   ThreatEdge,
@@ -61,7 +62,7 @@ export function expandAdversarialStrategies(
 // Fact Graph Snapshot for Security Analysis
 // ---------------------------------------------------------------------------
 
-interface SecurityEntity {
+export interface SecurityEntity {
   id: string;
   type: "feature" | "workflow" | "data_model";
   name: string;
@@ -80,6 +81,54 @@ interface SecurityEntity {
     relationship: string;
     strength: string;
   }>;
+}
+
+/**
+ * Build the security view from an already captured fact snapshot.
+ *
+ * Review profiles use this adapter so Dreams and Nightmares inspect the same
+ * immutable graph capture. The normal NIGHTMARE path still has its historical
+ * file-backed loader below, preserving its existing runtime contract.
+ */
+export function securityEntitiesFromFactSnapshot(
+  snapshot: FactSnapshot,
+): Map<string, SecurityEntity> {
+  const entities = new Map<string, SecurityEntity>();
+
+  for (const entity of snapshot.entities.values()) {
+    if (entity.type === "datastore") continue;
+    const baseText = `${entity.name} ${entity.description} ${entity.tags.join(" ")} ${entity.keywords.join(" ")}`.toLowerCase();
+    const text = entity.type === "data_model"
+      ? `${baseText} ${entity.key_fields.join(" ")} ${entity.relationships.map((r) => `${r.type} ${r.target} ${r.via}`).join(" ")}`
+      : baseText;
+    entities.set(entity.id, {
+      id: entity.id,
+      type: entity.type,
+      name: entity.name,
+      domain: entity.domain,
+      keywords: entity.keywords,
+      source_repo: entity.source_repo,
+      tags: entity.tags,
+      has_auth_refs: /auth|jwt|rbac|session|login|password/.test(text),
+      has_rls_refs: /rls|row.level|policy|permission|enabled/.test(text),
+      has_validation_refs: /validat|sanitiz|check|constrain|not.null/.test(text),
+      accepts_input: entity.type === "feature"
+        ? /input|form|submit|upload|create|write|post/.test(text)
+        : entity.type === "workflow"
+          ? /trigger|webhook|api|request|receive/.test(text)
+          : /insert|upsert|create|write/.test(text),
+      stores_data: entity.type === "data_model"
+        || /store|save|persist|database|table/.test(text),
+      links: entity.links.map((link) => ({
+        target: link.target,
+        type: link.type,
+        relationship: link.relationship,
+        strength: link.strength,
+      })),
+    });
+  }
+
+  return entities;
 }
 
 async function buildSecuritySnapshot(): Promise<Map<string, SecurityEntity>> {
@@ -425,6 +474,45 @@ function scanBrokenAccessControl(
   return threats;
 }
 
+/** Run selected adversarial scanners without reading or writing graph files. */
+export function runAdversarialStrategies(
+  entities: Map<string, SecurityEntity>,
+  strategy: AdversarialStrategy,
+  cycle: number,
+): ThreatEdge[] {
+  let allThreats: ThreatEdge[] = [];
+  for (const selected of expandAdversarialStrategies(strategy)) {
+    let threats: ThreatEdge[] = [];
+    switch (selected) {
+      case "privilege_escalation":
+        threats = scanPrivilegeEscalation(entities, cycle);
+        break;
+      case "data_leak_path":
+        threats = scanDataLeakPaths(entities, cycle);
+        break;
+      case "injection_surface":
+        threats = scanInjectionSurfaces(entities, cycle);
+        break;
+      case "missing_validation":
+        threats = scanMissingValidation(entities, cycle);
+        break;
+      case "broken_access_control":
+        threats = scanBrokenAccessControl(entities, cycle);
+        break;
+    }
+    logger.debug(`  ${selected}: ${threats.length} threats`);
+    allThreats.push(...threats);
+  }
+
+  const seen = new Set<string>();
+  return allThreats.filter((threat) => {
+    const key = canonicalThreatKey(threat);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Threat Log I/O
 // ---------------------------------------------------------------------------
@@ -487,41 +575,7 @@ export async function nightmare(
     `NIGHTMARE cycle starting: strategy=${strategy}, entities=${entities.size}`
   );
 
-  let allThreats: ThreatEdge[] = [];
-
-  const strategies = expandAdversarialStrategies(strategy);
-
-  for (const s of strategies) {
-    let threats: ThreatEdge[] = [];
-    switch (s) {
-      case "privilege_escalation":
-        threats = scanPrivilegeEscalation(entities, cycle);
-        break;
-      case "data_leak_path":
-        threats = scanDataLeakPaths(entities, cycle);
-        break;
-      case "injection_surface":
-        threats = scanInjectionSurfaces(entities, cycle);
-        break;
-      case "missing_validation":
-        threats = scanMissingValidation(entities, cycle);
-        break;
-      case "broken_access_control":
-        threats = scanBrokenAccessControl(entities, cycle);
-        break;
-    }
-    logger.debug(`  ${s}: ${threats.length} threats`);
-    allThreats.push(...threats);
-  }
-
-  // Deduplicate within this batch by canonical key (from|to|category|cwe).
-  const seen = new Set<string>();
-  allThreats = allThreats.filter((t) => {
-    const key = canonicalThreatKey(t);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  let allThreats = runAdversarialStrategies(entities, strategy, cycle);
 
   // Cross-batch dedupe + lifecycle gate.
   // For every threat already present in the persisted log under the same

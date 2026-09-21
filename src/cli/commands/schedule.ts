@@ -45,7 +45,7 @@ function fmtMs(ms: number): string {
 }
 
 const VALID_ACTIONS = [
-  "dream_cycle", "nightmare_cycle", "metacognitive_analysis",
+  "dream_cycle", "nightmare_cycle", "review_cycle", "metacognitive_analysis",
   "dispatch_cognitive_event", "narrative_chapter",
   "federation_export", "graph_maintenance",
 ];

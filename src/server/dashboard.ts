@@ -676,7 +676,7 @@ async function renderHealth(): Promise<string> {
 /* ------------------------------------------------------------------ */
 
 const SCHEDULE_ACTIONS: ScheduleAction[] = [
-  "dream_cycle", "nightmare_cycle", "metacognitive_analysis",
+  "dream_cycle", "nightmare_cycle", "review_cycle", "metacognitive_analysis",
   "dispatch_cognitive_event", "narrative_chapter", "federation_export",
   "graph_maintenance",
 ];
@@ -754,6 +754,13 @@ function buildScheduleParameters(
     }
     case "nightmare_cycle":
       return { strategy: body.nightmare_strategy ?? "all_threats" };
+    case "review_cycle": {
+      const expectedGraphVersion = (body.review_expected_graph_version ?? "").trim();
+      return {
+        profile_id: (body.review_profile_id ?? "dreams-and-nightmares").trim() || "dreams-and-nightmares",
+        ...(expectedGraphVersion ? { expected_graph_version: expectedGraphVersion } : {}),
+      };
+    }
     case "metacognitive_analysis": {
       const windowSize = parseInt(body.meta_window_size ?? "50", 10);
       return {
@@ -831,6 +838,16 @@ function renderActionParamPanels(): string {
             `<option value="${s}" ${s === "all_threats" ? "selected" : ""}>${s.replace(/_/g, " ")}</option>`
           ).join("")}
         </select>
+      </div>
+    </div>
+    <div id="params_review_cycle" class="action-params" style="display:none">
+      <div class="form-row">
+        <label>Review Profile</label>
+        <input name="review_profile_id" value="dreams-and-nightmares" placeholder="profile id">
+      </div>
+      <div class="form-row">
+        <label>Expected Graph Version</label>
+        <input name="review_expected_graph_version" placeholder="optional pinned graph version">
       </div>
     </div>
     <div id="params_metacognitive_analysis" class="action-params" style="display:none">
@@ -995,7 +1012,7 @@ async function renderSchedules(toast?: string): Promise<string> {
         <label>Action</label>
         <select name="action" id="schedule_action" onchange="
           var sel = this.value;
-          ['dream_cycle','nightmare_cycle','metacognitive_analysis','dispatch_cognitive_event','narrative_chapter','federation_export','graph_maintenance'].forEach(function(a){
+          ['dream_cycle','nightmare_cycle','review_cycle','metacognitive_analysis','dispatch_cognitive_event','narrative_chapter','federation_export','graph_maintenance'].forEach(function(a){
             var el = document.getElementById('params_' + a);
             if (el) el.style.display = (a === sel) ? '' : 'none';
           });
@@ -1056,7 +1073,10 @@ async function renderSchedules(toast?: string): Promise<string> {
     // Build a schedule-id → strategy lookup for the executions table
     const strategyMap = new Map<string, string>();
     for (const s of schedules) {
-      strategyMap.set(s.id, (s.parameters?.strategy as string) ?? "all");
+      strategyMap.set(s.id,
+        (s.parameters?.strategy as string)
+        ?? (s.parameters?.profile_id as string)
+        ?? "all");
     }
 
     body += `<table>

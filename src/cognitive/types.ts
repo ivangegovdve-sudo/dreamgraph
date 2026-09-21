@@ -2401,6 +2401,7 @@ export const DEFAULT_NARRATIVE_CONFIG: NarrativeConfig = {
 export type ScheduleAction =
   | "dream_cycle"
   | "nightmare_cycle"
+  | "review_cycle"
   | "metacognitive_analysis"
   | "dispatch_cognitive_event"
   | "narrative_chapter"
@@ -2465,6 +2466,8 @@ export interface ScheduleExecution {
   finding_count?: number;
   /** Graph freshness/version stamp used by a cognitive cycle. */
   graph_version?: string;
+  /** Persisted report produced by review_cycle. */
+  report_id?: string;
   error?: string;
   /** Instance UUID that produced this execution (null in legacy mode). */
   instance_uuid?: string;

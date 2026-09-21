@@ -86,6 +86,7 @@ export async function llmDream(
   snapshot: FactSnapshot,
   cycle: number,
   max: number,
+  promptOptions?: { role?: string; prompt?: string },
 ): Promise<{ edges: DreamEdge[]; nodes: DreamNode[] }> {
   const edges: DreamEdge[] = [];
   const nodes: DreamNode[] = [];
@@ -220,7 +221,7 @@ export async function llmDream(
     logger.debug(`LLM dream grounding: failed (${err instanceof Error ? err.message : "error"})`);
   }
 
-  const systemPrompt = `You are the cognitive dream engine of DreamGraph — a knowledge graph system that analyzes software projects. Your role is to DREAM: to make creative, speculative connections between entities that structural analysis alone would miss.
+  const defaultSystemPrompt = `You are the cognitive dream engine of DreamGraph — a knowledge graph system that analyzes software projects. Your role is to DREAM: to make creative, speculative connections between entities that structural analysis alone would miss.
 
 You analyze a knowledge graph of features, workflows, and data models and propose NOVEL relationships, hidden patterns, architectural insights, and potential risks.
 
@@ -257,6 +258,15 @@ Rules:
 CRITICAL: Your source_evidence field is verified programmatically against the actual source code provided. If it contains ANY text not present in the Source Code Evidence section, the edge is REJECTED. Copy-paste exact identifiers, class names, method names, or code fragments. Do NOT paraphrase, abbreviate, or invent code.
 
 CRITICAL: If the provided source code does NOT contain evidence for a connection, return FEWER edges or an empty array. It is better to return 0 edges than to fabricate evidence. Empty arrays are a valid and expected response.`;
+
+  // Profiles can add a role and prompt while the legacy dream() call keeps
+  // the historical system prompt unchanged. This is the seam for future
+  // Dreams profiles without making prompt text a scheduler concern.
+  const systemPrompt = [
+    promptOptions?.role ? `Profile role: ${promptOptions.role}` : "",
+    promptOptions?.prompt ? `Profile instructions:\n${promptOptions.prompt}` : "",
+    defaultSystemPrompt,
+  ].filter(Boolean).join("\n\n");
 
   const userPrompt = `# Knowledge Graph — Dream Cycle #${cycle}
 

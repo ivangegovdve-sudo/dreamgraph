@@ -27,6 +27,8 @@
  *   get_dream_insights          — Introspection: strongest hypotheses, clusters, tensions
  *   resolve_tension             — Close a tension with authority
  *   nightmare_cycle             — Adversarial security scan (NIGHTMARE state)
+ *   run_review_cycle            — Composite Dreams and Nightmares report
+ *   get_review_reports          — Read persisted composite review reports
  *   get_causal_insights         — Causal reasoning analysis
  *   get_temporal_insights       — Temporal pattern analysis
  *   export_dream_archetypes     — Federation: export anonymized patterns
@@ -89,6 +91,8 @@ import {
   isVerdictLedgerEnabled,
 } from "./verdict-ledger.js";
 import { reconcileDreamCycleArtifacts } from "./finding-model.js";
+import { getReviewProfile, loadReviewReports, runReviewCycle } from "./review-seam.js";
+import type { ReviewReport } from "./review-seam.js";
 import type {
   DreamCycleOutput,
   NormalizeDreamsOutput,
@@ -2310,6 +2314,48 @@ export function registerCognitiveTools(server: McpServer): void {
   // =========================================================================
 
   // =========================================================================
+  // run_review_cycle — Composite Dreams and Nightmares review
+  // =========================================================================
+  server.tool(
+    "run_review_cycle",
+    "Run a registered Dreams and Nightmares profile over one pinned graph snapshot and persist its unified report. UNKNOWN is returned as a failure-shaped response and is never treated as a clean result.",
+    {
+      profile_id: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Registered review profile (default: dreams-and-nightmares)."),
+      expected_graph_version: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Optional manifest version to pin; a mismatch fails closed as UNKNOWN."),
+    },
+    async ({ profile_id, expected_graph_version }) => {
+      const profileId = profile_id ?? "dreams-and-nightmares";
+      const result = await safeExecute<ReviewReport>(
+        async (): Promise<ToolResponse<ReviewReport>> => {
+          if (!getReviewProfile(profileId)) return error("NOT_FOUND", `Review profile not found: ${profileId}`);
+          const report = await runReviewCycle(profileId, { expected_graph_version });
+          if (report.outcome === "UNKNOWN") {
+            return error(
+              "UNKNOWN_INPUTS",
+              `${report.error?.message ?? "Review inputs are UNKNOWN"} report=${report.report_id}`,
+            );
+          }
+          return success(report);
+        },
+        "run_review_cycle",
+      );
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  // =========================================================================
   // schedule_dream — Create a new schedule
   // =========================================================================
   server.tool(
@@ -2317,7 +2363,7 @@ export function registerCognitiveTools(server: McpServer): void {
     "Create a new dream schedule for temporal orchestration of cognitive actions. " +
       "Supports interval (every N ms), cycle-based (every N dream cycles), " +
       "cron-like (hour/day patterns), and idle-time triggers. " +
-      "Actions: dream_cycle, nightmare_cycle, metacognitive_analysis, " +
+      "Actions: dream_cycle, nightmare_cycle, review_cycle, metacognitive_analysis, " +
       "dispatch_cognitive_event, narrative_chapter, federation_export, graph_maintenance.",
     {
       name: z
@@ -2327,6 +2373,7 @@ export function registerCognitiveTools(server: McpServer): void {
         .enum([
           "dream_cycle",
           "nightmare_cycle",
+          "review_cycle",
           "metacognitive_analysis",
           "dispatch_cognitive_event",
           "narrative_chapter",
@@ -2340,6 +2387,7 @@ export function registerCognitiveTools(server: McpServer): void {
         .describe(
           "Action-specific parameters. For dream_cycle: {strategy, max_dreams}. " +
           "For nightmare_cycle: {strategy}. For metacognitive_analysis: {window_size, auto_apply}. " +
+          "For review_cycle: {profile_id, expected_graph_version}. " +
           "For dispatch_cognitive_event: {source, severity, description, payload}."
         ),
       trigger_type: z
@@ -2453,6 +2501,7 @@ export function registerCognitiveTools(server: McpServer): void {
         .enum([
           "dream_cycle",
           "nightmare_cycle",
+          "review_cycle",
           "metacognitive_analysis",
           "dispatch_cognitive_event",
           "narrative_chapter",
@@ -2657,6 +2706,40 @@ export function registerCognitiveTools(server: McpServer): void {
         }
       );
 
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // =========================================================================
+  // get_review_reports — Persisted Dreams and Nightmares reports
+  // =========================================================================
+  server.tool(
+    "get_review_reports",
+    "Read persisted composite Dreams and Nightmares reports, including the pinned graph version, profile contract, unified findings, and explicit cycle outcome.",
+    {
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe("Maximum reports to return, newest first (default: 50)."),
+    },
+    async ({ limit }) => {
+      const lim = limit ?? 50;
+      const result = await safeExecute<{ reports: Awaited<ReturnType<typeof loadReviewReports>>; total: number }>(
+        async (): Promise<ToolResponse<{ reports: Awaited<ReturnType<typeof loadReviewReports>>; total: number }>> => {
+          const reports = (await loadReviewReports()).slice(-lim).reverse();
+          return success({ reports, total: reports.length });
+        }
+      );
       return {
         content: [
           {
