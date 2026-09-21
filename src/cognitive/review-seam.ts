@@ -129,13 +129,52 @@ const profileRegistry = new Map<string, ReviewProfile>([
   [DEFAULT_REVIEW_PROFILE.id, DEFAULT_REVIEW_PROFILE],
 ]);
 
-export function registerReviewProfile(profile: ReviewProfile): void {
+const SUPPORTED_REVIEW_DREAM_STRATEGIES = new Set<string>([
+  "gap_detection",
+  "weak_reinforcement",
+  "cross_domain",
+  "missing_abstraction",
+  "symmetry_completion",
+  "pgo_wave",
+  "orphan_bridging",
+  "llm_dream",
+]);
+
+const SUPPORTED_REVIEW_NIGHTMARE_STRATEGIES = new Set<string>([
+  "all",
+  "all_threats",
+  "privilege_escalation",
+  "data_leak_path",
+  "injection_surface",
+  "missing_validation",
+  "broken_access_control",
+]);
+
+function validateReviewProfile(profile: ReviewProfile): void {
   if (!profile.id.trim() || !profile.version.trim() || !profile.role.trim() || !profile.prompt.trim()) {
     throw new Error("Review profile requires id, version, role, and prompt");
   }
   if (profile.output_schema.id !== REVIEW_OUTPUT_SCHEMA.id || profile.output_schema.version !== REVIEW_OUTPUT_SCHEMA.version) {
     throw new Error(`Unsupported review output schema: ${profile.output_schema.id}@${profile.output_schema.version}`);
   }
+  if (profile.strategies.length === 0) {
+    throw new Error("Review profile requires at least one strategy");
+  }
+  for (const selection of profile.strategies) {
+    const separator = selection.indexOf(":");
+    const family = separator > 0 ? selection.slice(0, separator) : "";
+    const strategy = separator > 0 ? selection.slice(separator + 1) : "";
+    const supported = family === "dream"
+      ? strategy === "all" || SUPPORTED_REVIEW_DREAM_STRATEGIES.has(strategy)
+      : family === "nightmare" && SUPPORTED_REVIEW_NIGHTMARE_STRATEGIES.has(strategy);
+    if (!supported) {
+      throw new Error(`Review strategy '${selection}' is not supported by the snapshot seam`);
+    }
+  }
+}
+
+export function registerReviewProfile(profile: ReviewProfile): void {
+  validateReviewProfile(profile);
   profileRegistry.set(profile.id, { ...profile, strategies: [...profile.strategies] });
 }
 
@@ -265,6 +304,7 @@ export async function runReviewProfile(
   profile: ReviewProfile,
   snapshot: ReviewSnapshot,
 ): Promise<ReviewRunResult> {
+  validateReviewProfile(profile);
   if (profile.output_schema.id !== REVIEW_OUTPUT_SCHEMA.id || profile.output_schema.version !== REVIEW_OUTPUT_SCHEMA.version) {
     throw new Error(`Unsupported review output schema: ${profile.output_schema.id}@${profile.output_schema.version}`);
   }
@@ -359,6 +399,43 @@ function emptyReportFile(): ReviewReportFile {
   return { schema: "dreamgraph.review_reports.v1", reports: [] };
 }
 
+function isMissingFile(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { code?: unknown }).code === "ENOENT";
+}
+
+async function readReviewReportFile(target: string): Promise<ReviewReportFile> {
+  let raw: string;
+  try {
+    raw = await readFile(target, "utf8");
+  } catch (error) {
+    if (isMissingFile(error)) return emptyReportFile();
+    throw new Error("Review report store is unreadable");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("Review report store is unreadable");
+  }
+  if (
+    typeof parsed !== "object"
+    || parsed === null
+    || Array.isArray(parsed)
+    || (parsed as { schema?: unknown }).schema !== "dreamgraph.review_reports.v1"
+    || !Array.isArray((parsed as { reports?: unknown }).reports)
+  ) {
+    throw new Error("Review report store is invalid");
+  }
+  return {
+    schema: "dreamgraph.review_reports.v1",
+    reports: (parsed as { reports: ReviewReport[] }).reports,
+  };
+}
+
 export async function persistReviewReport(
   report: ReviewReport,
   dataDir = getDataDir(),
@@ -367,19 +444,7 @@ export async function persistReviewReport(
   const target = dataDir === getDataDir() ? path : resolve(dataDir, "review_reports.json");
   await mkdir(dataDir, { recursive: true });
   await withFileLock(`review_reports:${target}`, async () => {
-    let file = emptyReportFile();
-    try {
-      const parsed = JSON.parse(await readFile(target, "utf8")) as Partial<ReviewReportFile>;
-      if (parsed.schema === "dreamgraph.review_reports.v1" && Array.isArray(parsed.reports)) {
-        file = { schema: parsed.schema, reports: parsed.reports as ReviewReport[] };
-      }
-    } catch {
-      // A missing report store starts empty; malformed existing data is not
-      // silently treated as a successful review history.
-      if (await readFile(target, "utf8").then(() => true, () => false)) {
-        throw new Error("Review report store is unreadable");
-      }
-    }
+    const file = await readReviewReportFile(target);
     file.reports.push(report);
     await atomicWriteFile(target, serializeReviewReports(file));
   });
@@ -392,16 +457,7 @@ function serializeReviewReports(file: ReviewReportFile): string {
 
 export async function loadReviewReports(dataDir = getDataDir()): Promise<ReviewReport[]> {
   const path = dataDir === getDataDir() ? dataPath("review_reports.json") : resolve(dataDir, "review_reports.json");
-  try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<ReviewReportFile>;
-    if (parsed.schema !== "dreamgraph.review_reports.v1" || !Array.isArray(parsed.reports)) {
-      throw new Error("Review report store is invalid");
-    }
-    return parsed.reports as ReviewReport[];
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Review report store")) throw error;
-    return [];
-  }
+  return (await readReviewReportFile(path)).reports;
 }
 
 export async function runReviewCycle(
