@@ -53,12 +53,29 @@ function fixtureSnapshot(): ReviewSnapshot {
     relationships: [],
     descriptionTokens: new Set(["user", "email", "storage"]),
   };
+  const reviewFeature = {
+    id: "feature:review",
+    type: "feature" as const,
+    name: "Review form",
+    description: "Allows a reviewer to inspect incoming records.",
+    domain: "web",
+    keywords: ["review", "records"],
+    source_repo: "fixture-repo",
+    source_files: ["src/review.ts"],
+    tags: [],
+    category: "feature",
+    links: [],
+    steps: [],
+    key_fields: [],
+    relationships: [],
+    descriptionTokens: new Set(["reviewer", "inspect", "incoming", "records"]),
+  };
   const fact: FactSnapshot = {
-    entities: new Map([[feature.id, feature], [model.id, model]]),
+    entities: new Map([[feature.id, feature], [model.id, model], [reviewFeature.id, reviewFeature]]),
     edgeSet: new Set([`${feature.id}|${model.id}`]),
     domains: new Set(["web", "data"]),
-    sourceFileIndex: new Map([["src/upload.ts", [feature.id]], ["db/users.sql", [model.id]]]),
-    degree: new Map([[feature.id, 1], [model.id, 1]]),
+    sourceFileIndex: new Map([["src/upload.ts", [feature.id]], ["db/users.sql", [model.id]], ["src/review.ts", [reviewFeature.id]]]),
+    degree: new Map([[feature.id, 1], [model.id, 1], [reviewFeature.id, 0]]),
   };
   return {
     context: {
@@ -66,7 +83,7 @@ function fixtureSnapshot(): ReviewSnapshot {
       captured_at: "2026-09-16T00:00:00.000Z",
       graph_version: "fixture-version-1",
       repository_names: ["fixture-repo"],
-      entity_count: 2,
+      entity_count: 3,
     },
     fact,
     security: securityEntitiesFromFactSnapshot(fact),
@@ -76,9 +93,9 @@ function fixtureSnapshot(): ReviewSnapshot {
 const profile: ReviewProfile = {
   id: "fixture-profile",
   version: "1.0.0",
-  role: "security reviewer",
-  prompt: "Look for actionable security threats in the supplied graph.",
-  strategies: ["nightmare:all_threats"],
+  role: "opportunity and threat reviewer",
+  prompt: "Find one grounded opportunity and actionable threats in the supplied graph.",
+  strategies: ["dream:gap_detection", "nightmare:all_threats"],
   output_schema: REVIEW_OUTPUT_SCHEMA,
 };
 
@@ -93,21 +110,8 @@ describe("Dreams and Nightmares review seam", () => {
     expect(result.context.run_id).toBe("run_fixture");
     expect(result.outcome).toBe("FOUND");
     expect(result.findings.length).toBeGreaterThan(0);
-    expect(result.findings.every((finding) => finding.provenance.kind === "threat_edge")).toBe(true);
-
-    const dreamSnapshot = fixtureSnapshot();
-    const secondFeature = {
-      ...dreamSnapshot.fact.entities.get("feature:upload")!,
-      id: "feature:review",
-      name: "Review form",
-      links: [],
-    };
-    dreamSnapshot.fact.entities.set(secondFeature.id, secondFeature);
-    dreamSnapshot.fact.edgeSet.delete("feature:review|data_model:users");
-    dreamSnapshot.security = securityEntitiesFromFactSnapshot(dreamSnapshot.fact);
-    const dreamResult = await runReviewProfile({ ...profile, strategies: ["dream:gap_detection"] }, dreamSnapshot);
-    expect(dreamResult.outcome).toBe("FOUND");
-    expect(dreamResult.findings.some((finding) => finding.provenance.kind === "dream_edge")).toBe(true);
+    expect(new Set(result.findings.map((finding) => finding.provenance.kind)))
+      .toEqual(new Set(["dream_edge", "threat_edge"]));
   });
 
   it("keeps UNKNOWN explicit and rejects an UNKNOWN report without an error", () => {
@@ -144,7 +148,8 @@ describe("Dreams and Nightmares review seam", () => {
 
       expect(reports).toHaveLength(1);
       expect(reports[0].profile).toMatchObject({ id: "fixture-profile", version: "1.0.0" });
-      expect(reports[0].findings[0].provenance.kind).toBe("threat_edge");
+      expect(new Set(reports[0].findings.map((finding) => finding.provenance.kind)))
+        .toEqual(new Set(["dream_edge", "threat_edge"]));
       expect(JSON.parse(await readFile(join(dataDir, "review_reports.json"), "utf8")).reports).toHaveLength(1);
     } finally {
       await rm(dataDir, { recursive: true, force: true });
