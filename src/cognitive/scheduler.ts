@@ -45,7 +45,12 @@ import type { LlmMessage } from "./llm.js";
 import { preflightGraphInputs } from "./cycle-input-gate.js";
 import { formatCycleSummary } from "./cycle-outcome.js";
 import type { CycleOutcome, ScheduleActionResult } from "./cycle-outcome.js";
-import { emitDreamCycleVerdict, emitNightmareVerdict } from "./verdict-ledger.js";
+import {
+  emitDreamCycleVerdict,
+  emitNightmareVerdict,
+  isVerdictLedgerEnabled,
+} from "./verdict-ledger.js";
+import { reconcileDreamCycleArtifacts } from "./finding-model.js";
 import type { CycleInputReady } from "./cycle-input-gate.js";
 import type { TensionResolutionCandidate, TensionResolutionStrategy, TensionSignal } from "./types.js";
 import { withFileLock } from "../utils/mutex.js";
@@ -438,6 +443,13 @@ async function executeAction(schedule: DreamSchedule): Promise<ScheduleActionRes
         "scheduler"
       );
 
+      const ledgerArtifacts = isVerdictLedgerEnabled()
+        ? reconcileDreamCycleArtifacts(
+            { nodes: dreamResult.nodes, edges: dreamResult.edges },
+            await engine.loadDreamGraph(),
+          )
+        : { nodes: dreamResult.nodes, edges: dreamResult.edges };
+
       engine.wake();
 
       // Record history
@@ -574,8 +586,8 @@ async function executeAction(schedule: DreamSchedule): Promise<ScheduleActionRes
       if (engine.getState() !== "awake") await engine.interrupt();
 
       await emitDreamCycleVerdict({
-        nodes: dreamResult.nodes,
-        edges: dreamResult.edges,
+        nodes: ledgerArtifacts.nodes,
+        edges: ledgerArtifacts.edges,
         outcome: dreamResult.outcome,
         graph_version: cycleInput!.graph_version,
       });

@@ -1,18 +1,20 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  findingsFromDreamCycle,
   findingFromDreamEdge,
   findingFromThreatEdge,
+  reconcileDreamCycleArtifacts,
 } from "../../src/cognitive/finding-model.js";
 import {
   appendVerdictLedger,
   isVerdictLedgerEnabled,
   readVerdictLedger,
 } from "../../src/cognitive/verdict-ledger.js";
-import type { DreamEdge, ThreatEdge } from "../../src/cognitive/types.js";
+import type { DreamEdge, DreamNode, ThreatEdge } from "../../src/cognitive/types.js";
 
 const dreamEdge: DreamEdge = {
   id: "dream-edge-1",
@@ -35,6 +37,24 @@ const dreamEdge: DreamEdge = {
   plausibility: 0.7,
   evidence_score: 0.5,
   contradiction_score: 0,
+};
+
+const dreamNode: DreamNode = {
+  id: "dream-node-1",
+  type: "hypothetical_feature",
+  name: "Unified deployment view",
+  description: "A shared deployment view could reduce release drift.",
+  inspiration: ["feature-a"],
+  confidence: 0.61,
+  origin: "rem",
+  created_at: "2026-09-16T12:00:00.000Z",
+  dream_cycle: 4,
+  ttl: 5,
+  decay_rate: 0.1,
+  reinforcement_count: 0,
+  last_reinforced_cycle: 4,
+  status: "candidate",
+  activation_score: 0.8,
 };
 
 const threatEdge: ThreatEdge = {
@@ -100,6 +120,43 @@ describe("unified finding model", () => {
     });
     expect(threat.provenance.kind === "threat_edge" && threat.provenance.edge).toBe(threatEdge);
   });
+
+  it("uses the persisted post-normalization artifact state", () => {
+    const normalizedNode: DreamNode = {
+      ...dreamNode,
+      confidence: 0.94,
+      status: "rejected",
+    };
+    const normalizedEdge: DreamEdge = {
+      ...dreamEdge,
+      confidence: 0.88,
+      status: "validated",
+    };
+    const reconciled = reconcileDreamCycleArtifacts(
+      { nodes: [dreamNode], edges: [dreamEdge] },
+      { nodes: [normalizedNode], edges: [normalizedEdge] },
+    );
+    const findings = findingsFromDreamCycle(reconciled.nodes, reconciled.edges, {
+      outcome: "FOUND",
+      entity_repositories: repositories,
+    });
+
+    expect(findings).toHaveLength(2);
+    expect(findings[0]).toMatchObject({
+      finding_id: "opportunity:node:dream-node-1",
+      lifecycle_state: "rejected",
+      confidence: 0.94,
+      next_action: "discard opportunity",
+    });
+    expect(findings[1]).toMatchObject({
+      finding_id: "opportunity:dream-edge-1",
+      lifecycle_state: "validated",
+      confidence: 0.88,
+      next_action: "use validated opportunity",
+    });
+    expect(findings[0].provenance.kind === "dream_node" && findings[0].provenance.node).toBe(normalizedNode);
+    expect(findings[1].provenance.kind === "dream_edge" && findings[1].provenance.edge).toBe(normalizedEdge);
+  });
 });
 
 describe("append-only verdict ledger", () => {
@@ -115,6 +172,20 @@ describe("append-only verdict ledger", () => {
 
   it("defaults the emission switch off", () => {
     expect(isVerdictLedgerEnabled()).toBe(false);
+  });
+
+  it("reads the emission switch after instance environment loading", () => {
+    const previous = process.env.DREAMGRAPH_VERDICT_LEDGER_ENABLED;
+    try {
+      process.env.DREAMGRAPH_VERDICT_LEDGER_ENABLED = "true";
+      expect(isVerdictLedgerEnabled()).toBe(true);
+
+      process.env.DREAMGRAPH_VERDICT_LEDGER_ENABLED = "false";
+      expect(isVerdictLedgerEnabled()).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.DREAMGRAPH_VERDICT_LEDGER_ENABLED;
+      else process.env.DREAMGRAPH_VERDICT_LEDGER_ENABLED = previous;
+    }
   });
 
   it("is inert when the emission switch is omitted or disabled", async () => {
@@ -185,5 +256,46 @@ describe("append-only verdict ledger", () => {
       reason: "graph inputs were unreadable",
     });
     expect(JSON.stringify(result.entry)).not.toMatch(/DRY|clean|0 findings/i);
+  });
+
+  it("repairs a truncated final record before the next append", async () => {
+    const first = await appendVerdictLedger({
+      data_dir: dataDir,
+      enabled: true,
+      run_id: "run-1",
+      outcome: "FOUND",
+      graph_version: "graph-v1",
+      findings: [findingFromDreamEdge(dreamEdge, { outcome: "FOUND" })],
+    });
+    await appendFile(join(dataDir, "verdict_ledger.jsonl"), '{"schema":"dreamgraph.verdict_ledger.v1","run_id":"torn');
+
+    await expect(readVerdictLedger(dataDir)).resolves.toHaveLength(1);
+
+    const resumed = await appendVerdictLedger({
+      data_dir: dataDir,
+      enabled: true,
+      run_id: "run-2",
+      outcome: "DRY",
+      graph_version: "graph-v1",
+      findings: [],
+    });
+
+    expect(resumed.previous_run_id).toBe(first.run_id);
+    expect(await readVerdictLedger(dataDir)).toHaveLength(2);
+    expect((await readFile(join(dataDir, "verdict_ledger.jsonl"), "utf8")).trim().split("\n")).toHaveLength(2);
+  });
+
+  it("rejects completed corrupt records instead of hiding them as a torn tail", async () => {
+    await appendVerdictLedger({
+      data_dir: dataDir,
+      enabled: true,
+      run_id: "run-1",
+      outcome: "DRY",
+      graph_version: "graph-v1",
+      findings: [],
+    });
+    await appendFile(join(dataDir, "verdict_ledger.jsonl"), "not-json\n");
+
+    await expect(readVerdictLedger(dataDir)).rejects.toThrow("record 2 is not valid JSON");
   });
 });
