@@ -7,13 +7,14 @@
  * filters hallucinations from insights.
  *
  * Provider hierarchy (tried in order):
- *   1. Direct API (Ollama / OpenAI-compatible / Anthropic) — autonomous daemon dreaming
- *   2. MCP Sampling — ask the connected client's LLM (human-in-the-loop)
- *   3. None — structural-only fallback (degraded mode)
+ *   1. Jan local llama.cpp / Qwen3 Coder, then SailResearch — autonomous daemon dreaming
+ *   2. Other explicitly configured direct providers (Ollama / OpenAI-compatible / Anthropic)
+ *   3. MCP Sampling — ask the connected client's LLM (human-in-the-loop)
+ *   4. None — structural-only fallback (degraded mode)
  *
  * Configuration (env vars):
  *   Shared:
- *     DREAMGRAPH_LLM_PROVIDER   = "ollama" | "openai" | "anthropic" | "sampling" | "none"
+ *     DREAMGRAPH_LLM_PROVIDER   = "jan" | "ollama" | "openai" | "anthropic" | "sampling" | "none"
  *     DREAMGRAPH_LLM_URL        = API base URL (default: http://localhost:11434 for Ollama)
  *     DREAMGRAPH_LLM_API_KEY    = API key for OpenAI-compatible providers
  *
@@ -40,7 +41,7 @@ import { logger } from "../utils/logger.js";
 // Core types
 // ---------------------------------------------------------------------------
 
-export type LlmProviderType = "ollama" | "lmstudio" | "openai" | "anthropic" | "sampling" | "none";
+export type LlmProviderType = "jan" | "ollama" | "lmstudio" | "openai" | "anthropic" | "sampling" | "none";
 
 export interface LlmConfig {
   provider: LlmProviderType;
@@ -135,6 +136,12 @@ export interface LlmProvider {
   isAvailable(): Promise<boolean>;
   /** Generate a completion */
   complete(messages: LlmMessage[], options?: LlmCompletionOptions): Promise<LlmResponse>;
+  /** Optional route metadata for composite providers. */
+  getRouteInfo?(componentModel: string): {
+    provider: string;
+    model: string;
+    fallbackReason?: LlmRouteFallbackReason;
+  };
 }
 
 export type LlmToolDefinition = {
@@ -175,7 +182,10 @@ export type LlmRouteFallbackReason =
   | "daemon_model_unavailable"
   | "provider_failed"
   | "invalid_output"
-  | "validation_failed";
+  | "validation_failed"
+  | "jan_unavailable"
+  | "jan_disabled"
+  | "sailresearch_unavailable";
 
 export type LlmRouteTask =
   | "remediation_drafting"
@@ -370,7 +380,12 @@ export function getModelCapabilities(provider: LlmProviderType | string, model: 
       supportsJsonSchema: false,
     };
   }
-  if (normalizedProvider === "ollama" || normalizedProvider === "lmstudio") {
+  if (
+    normalizedProvider === "jan" ||
+    normalizedProvider === "lmstudio" ||
+    normalizedProvider === "sailresearch" ||
+    normalizedProvider === "ollama"
+  ) {
     return {
       model: normalizedModel,
       api: normalizedProvider === "ollama" ? "ollama-chat" : "chat-completions",
@@ -1156,6 +1171,86 @@ class McpSamplingProvider implements LlmProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Jan-first provider — local llama.cpp with SailResearch failover
+// ---------------------------------------------------------------------------
+
+class JanFirstProvider implements LlmProvider {
+  private activeProvider: LlmProvider | null = null;
+  private fallbackReason: LlmRouteFallbackReason | undefined;
+
+  constructor(
+    private jan: LlmProvider,
+    private sailResearch: LlmProvider,
+    private janEnabled: boolean,
+    private janModel: string,
+    private sailResearchModel: string,
+  ) {}
+
+  get name(): string {
+    return this.activeProvider?.name ?? "jan";
+  }
+
+  async isAvailable(): Promise<boolean> {
+    this.activeProvider = null;
+    this.fallbackReason = undefined;
+
+    if (!this.janEnabled) {
+      this.fallbackReason = "jan_disabled";
+    } else if (await this.jan.isAvailable().catch(() => false)) {
+      this.activeProvider = this.jan;
+      return true;
+    } else {
+      this.fallbackReason = "jan_unavailable";
+    }
+
+    if (await this.sailResearch.isAvailable().catch(() => false)) {
+      this.activeProvider = this.sailResearch;
+      return true;
+    }
+
+    this.activeProvider = null;
+    this.fallbackReason = "sailresearch_unavailable";
+    return false;
+  }
+
+  async complete(messages: LlmMessage[], options?: LlmCompletionOptions): Promise<LlmResponse> {
+    if (!this.activeProvider && !(await this.isAvailable())) {
+      throw new Error("Jan and SailResearch are unavailable");
+    }
+
+    const provider = this.activeProvider!;
+    const model = provider === this.jan ? this.janModel : this.sailResearchModel;
+    try {
+      return await provider.complete(messages, { ...options, model: options?.model ?? model });
+    } catch (error) {
+      if (provider !== this.jan || !(await this.sailResearch.isAvailable().catch(() => false))) {
+        throw error;
+      }
+
+      this.activeProvider = this.sailResearch;
+      this.fallbackReason = "jan_unavailable";
+      return this.sailResearch.complete(messages, {
+        ...options,
+        model: options?.model ?? this.sailResearchModel,
+      });
+    }
+  }
+
+  getRouteInfo(componentModel: string): {
+    provider: string;
+    model: string;
+    fallbackReason?: LlmRouteFallbackReason;
+  } {
+    const usingJan = this.activeProvider === this.jan || !this.activeProvider;
+    return {
+      provider: usingJan ? "jan" : "sailresearch",
+      model: usingJan ? (componentModel || this.janModel) : this.sailResearchModel,
+      fallbackReason: this.fallbackReason,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Null Provider — structural-only fallback (degraded mode)
 // ---------------------------------------------------------------------------
 
@@ -1169,8 +1264,8 @@ class NullProvider implements LlmProvider {
   async complete(): Promise<LlmResponse> {
     throw new Error(
       "LLM provider not configured. Dreams require an LLM. " +
-      "Set DREAMGRAPH_LLM_PROVIDER=ollama and ensure Ollama is running, " +
-      "or set DREAMGRAPH_LLM_PROVIDER=openai/anthropic with DREAMGRAPH_LLM_API_KEY."
+      "Ensure Jan is running or set DREAMGRAPH_JAN_ENABLED=false to use SailResearch, " +
+      "or explicitly select another supported provider."
     );
   }
 }
@@ -1180,7 +1275,7 @@ class NullProvider implements LlmProvider {
 // ---------------------------------------------------------------------------
 
 export function parseLlmConfig(): LlmConfig {
-  const provider = (process.env.DREAMGRAPH_LLM_PROVIDER ?? "ollama") as LlmProviderType;
+  const provider = (process.env.DREAMGRAPH_LLM_PROVIDER ?? "jan") as LlmProviderType;
 
   // Provider defaults — model/temperature/maxTokens serve as fallbacks
   // for per-component configs (dreamer, normalizer) when their env vars
@@ -1196,6 +1291,11 @@ export function parseLlmConfig(): LlmConfig {
   let apiKey: string;
 
   switch (provider) {
+    case "jan":
+      model = process.env.DREAMGRAPH_JAN_MODEL ?? process.env.DREAMGRAPH_LLM_MODEL ?? "Qwen3-Coder-30B-A3B-Instruct.gguf";
+      baseUrl = process.env.DREAMGRAPH_JAN_URL ?? "http://127.0.0.1:1338/v1";
+      apiKey = process.env.DREAMGRAPH_JAN_API_KEY ?? "";
+      break;
     case "ollama":
       model = "qwen3:8b";
       baseUrl = process.env.DREAMGRAPH_LLM_URL ?? "http://localhost:11434";
@@ -1262,7 +1362,7 @@ function parseComponentConfig(
   return { model, temperature, maxTokens };
 }
 
-const LLM_PROVIDER_TYPES: readonly LlmProviderType[] = ["ollama", "lmstudio", "openai", "anthropic", "sampling", "none"];
+const LLM_PROVIDER_TYPES: readonly LlmProviderType[] = ["jan", "ollama", "lmstudio", "openai", "anthropic", "sampling", "none"];
 
 function envText(key: string): string | null {
   const value = process.env[key]?.trim();
@@ -1276,6 +1376,12 @@ function envNumber(key: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function envFlag(key: string, fallback: boolean): boolean {
+  const value = envText(key);
+  if (!value) return fallback;
+  return !["0", "false", "no", "off", "disabled"].includes(value.toLowerCase());
+}
+
 function parseProviderOverride(raw: string | null): LlmProviderType | null {
   const normalized = raw?.toLowerCase() as LlmProviderType | undefined;
   return normalized && LLM_PROVIDER_TYPES.includes(normalized) ? normalized : null;
@@ -1283,6 +1389,12 @@ function parseProviderOverride(raw: string | null): LlmProviderType | null {
 
 function providerDefaults(provider: LlmProviderType, base: LlmConfig): Pick<LlmConfig, "model" | "baseUrl" | "apiKey"> {
   switch (provider) {
+    case "jan":
+      return {
+        model: process.env.DREAMGRAPH_JAN_MODEL ?? "Qwen3-Coder-30B-A3B-Instruct.gguf",
+        baseUrl: process.env.DREAMGRAPH_JAN_URL ?? "http://127.0.0.1:1338/v1",
+        apiKey: process.env.DREAMGRAPH_JAN_API_KEY ?? "",
+      };
     case "ollama":
       return { model: "qwen3:8b", baseUrl: "http://localhost:11434", apiKey: "" };
     case "lmstudio":
@@ -1439,8 +1551,33 @@ let _provider: LlmProvider | null = null;
 let _samplingProvider: McpSamplingProvider | null = null;
 let _config: LlmConfig | null = null;
 
+function createJanFirstProvider(c: LlmConfig): LlmProvider {
+  const sailResearchUrl = process.env.DREAMGRAPH_SAILRESEARCH_URL ?? "https://api.sailresearch.com/v1";
+  const sailResearchApiKey = process.env.DREAMGRAPH_SAILRESEARCH_API_KEY ?? process.env.DREAMGRAPH_LLM_API_KEY ?? "";
+  const sailResearchModel = process.env.DREAMGRAPH_SAILRESEARCH_MODEL ?? "google/gemma-4-31B-it";
+  const jan = new OpenAiCompatibleProvider(c.baseUrl, c.model, c.apiKey, c.temperature, c.maxTokens, "jan", c.timeoutMs);
+  const sailResearch = new OpenAiCompatibleProvider(
+    sailResearchUrl,
+    sailResearchModel,
+    sailResearchApiKey,
+    c.temperature,
+    c.maxTokens,
+    "sailresearch",
+    c.timeoutMs,
+  );
+  return new JanFirstProvider(
+    jan,
+    sailResearch,
+    envFlag("DREAMGRAPH_JAN_ENABLED", true),
+    c.model,
+    sailResearchModel,
+  );
+}
+
 export function createLlmProviderForConfig(c: LlmConfig): LlmProvider {
   switch (c.provider) {
+    case "jan":
+      return createJanFirstProvider(c);
     case "ollama":
       return new OllamaProvider(c.baseUrl, c.model, c.temperature, c.maxTokens, c.timeoutMs);
     case "openai":
@@ -1475,6 +1612,9 @@ export function initLlmProvider(cfg?: LlmConfig): LlmProvider {
   _architectConfig = null;
 
   switch (c.provider) {
+    case "jan":
+      _provider = createJanFirstProvider(c);
+      break;
     case "ollama":
       _provider = new OllamaProvider(c.baseUrl, c.model, c.temperature, c.maxTokens, c.timeoutMs);
       break;
@@ -1626,12 +1766,13 @@ export async function selectLlmRoute(request: LlmRouteRequest): Promise<LlmRoute
   } else if (cfg.provider !== "none") {
     const component = request.daemon_component ?? "dreamer";
     const componentCfg = componentConfig(component);
-    const daemonModel = componentCfg.model.trim();
+    const available = await provider.isAvailable().catch(() => false);
+    const routeInfo = provider.getRouteInfo?.(componentCfg.model.trim());
+    const daemonModel = (routeInfo?.model ?? componentCfg.model).trim();
     if (!daemonModel) {
       return fallbackSelection(request, "no_daemon_model");
     }
 
-    const available = await provider.isAvailable().catch(() => false);
     if (available) {
       const temperature = request.daemon_temperature ?? taskDefaultTemperature(request.task);
       return {
@@ -1646,15 +1787,19 @@ export async function selectLlmRoute(request: LlmRouteRequest): Promise<LlmRoute
         provenance: {
           task: request.task,
           layer: "daemon",
-          provider: provider.name,
+          provider: routeInfo?.provider ?? provider.name,
           model: daemonModel,
           source: "daemon",
           temperature,
+          ...(routeInfo?.fallbackReason ? { fallback_reason: routeInfo.fallbackReason } : {}),
         },
       };
     }
 
-    return fallbackSelection(request, "daemon_model_unavailable");
+    return fallbackSelection(
+      request,
+      provider.getRouteInfo?.(componentCfg.model.trim())?.fallbackReason ?? "daemon_model_unavailable",
+    );
   }
 
   return fallbackSelection(

@@ -23,6 +23,24 @@ You can find the UUID from `dg status <name>`.
 
 ### Minimum viable config
 
+New instances are local-first: DreamGraph tries Jan's local llama.cpp server with Qwen3 Coder first, then uses SailResearch if Jan is unavailable or explicitly disabled. The SailResearch key must be supplied through the process environment or a secret-manager wrapper; it is never stored in the template.
+
+```dotenv
+DREAMGRAPH_LLM_PROVIDER=jan
+DREAMGRAPH_JAN_ENABLED=true
+DREAMGRAPH_JAN_URL=http://127.0.0.1:1338/v1
+DREAMGRAPH_JAN_MODEL=Qwen3-Coder-30B-A3B-Instruct.gguf
+DREAMGRAPH_SAILRESEARCH_URL=https://api.sailresearch.com/v1
+DREAMGRAPH_SAILRESEARCH_API_KEY=<provided-at-runtime>
+DREAMGRAPH_SAILRESEARCH_MODEL=google/gemma-4-31B-it
+```
+
+Set `DREAMGRAPH_JAN_ENABLED=false` to skip the local route and go directly to SailResearch. If both routes are unavailable, DreamGraph records deterministic fallback provenance and does not claim an LLM result.
+
+Jan's local API server must expose an OpenAI-compatible `/v1` endpoint. Override `DREAMGRAPH_JAN_URL` when Jan is configured on a non-loopback host or a different port.
+
+For an explicitly selected non-Jan provider, use the existing configuration:
+
 ```bash
 DREAMGRAPH_LLM_PROVIDER=openai
 DREAMGRAPH_LLM_URL=https://api.openai.com/v1
